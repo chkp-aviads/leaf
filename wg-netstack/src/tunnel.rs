@@ -52,10 +52,14 @@ const TIMER_TICK: Duration = Duration::from_millis(250);
 /// queue drops packets exactly as a full NIC ring would.
 ///
 /// Coupled to the TCP buffer sizes in `stack.rs`: a receive window larger than
-/// this many packets can outrun the ring, and the resulting drops make TCP back
-/// off -- measurably *reducing* throughput. 32 packets pairs with TCP buffers up
-/// to 32 KiB; raise both together or neither.
-const QUEUE_DEPTH: usize = 32;
+/// this many packets outruns the ring, and the resulting drops make TCP back off
+/// -- measurably *reducing* throughput. Measured: 64 KiB buffers on a 32-packet
+/// ring lost throughput and dropped packets; the same buffers on a 256-packet
+/// ring nearly doubled it with no drops.
+///
+/// Costs `QUEUE_DEPTH * MTU` per tunnel (~384 KiB here), paid once, which is
+/// cheap next to per-connection buffers. See the table in `stack.rs`.
+const QUEUE_DEPTH: usize = 256;
 
 pub type Packet = Vec<u8>;
 

@@ -126,7 +126,7 @@ outbound-vless = ["hex"]
 outbound-reality = ["reality", "reality-rustls", "webpki-roots", "rustls-pemfile", "hex", "base64"]
 outbound-amux= ["tokio-util"]
 outbound-quic = ["rustls", "webpki-roots-old", "rustls-pemfile-old"]
-outbound-wireguard = ["wg-netstack", "tokio-smoltcp"]
+outbound-wireguard = ["wg-netstack"]
 outbound-mptp = []
 outbound-select = ["directories", "axum/query"]
 outbound-vmess = ["lz_fnv", "cfb-mode", "hmac", "sha2", "aes", "aes-gcm", "sha3", "digest", "md-5", "tokio-util", "byteorder", "crc32fast"]
@@ -275,7 +275,6 @@ notify = { version = "6", optional = true }
 tun = { version = "0.7", features = ["async"], optional = true  }
 netstack-lwip = { git = "https://github.com/eycorsican/netstack-lwip", rev = "4cc3162", optional = true }
 wg-netstack = { path = "../wg-netstack", optional = true }
-tokio-smoltcp = { version = "0.6", default-features = false, features = ["proto-ipv4", "proto-ipv6"], optional = true }
 netstack-smoltcp = { git = "https://github.com/eycorsican/netstack-smoltcp", branch = "pr-16-initialize-unfilled", optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]

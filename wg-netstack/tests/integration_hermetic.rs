@@ -562,3 +562,60 @@ async fn reconnect_reusing_the_same_4_tuple_is_refused_by_a_smoltcp_peer() {
     );
     slot.clear();
 }
+
+/// The socket cap must refuse rather than allocate without bound.
+///
+/// Not a theoretical guard: leaf accepts as many SOCKS5 CONNECTs as arrive, and
+/// each in-tunnel socket costs TCP_RX_BUFFER + TCP_TX_BUFFER. Without this,
+/// a connection burst is an out-of-memory kill of the whole extension.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn socket_cap_refuses_instead_of_allocating_without_bound() {
+    let peer = TestPeer::start(CLIENT_SECRET, PEER_SECRET).await;
+    peer.spawn_tcp_echo(ECHO_PORT).await;
+    let cfg = WgConfig::parse(&peer.client_config(CLIENT_SECRET)).unwrap();
+    let (tunnel, device, tasks) = WgTunnel::connect(&cfg).await.unwrap();
+    let stack = WgStack::new(device, &tunnel).unwrap();
+    wait_up(&tunnel).await;
+
+    let dst = SocketAddr::from((PEER_ADDR, ECHO_PORT));
+    let limit = wg_netstack::stack::MAX_TCP_SOCKETS;
+
+    // Hold connections open so slots stay claimed.
+    let mut held = Vec::new();
+    for i in 0..limit {
+        match tokio::time::timeout(Duration::from_secs(10), stack.connect_tcp(dst)).await {
+            Ok(Ok(conn)) => held.push(conn),
+            Ok(Err(e)) => panic!("connection {i} of {limit} was refused early: {e}"),
+            Err(_) => panic!("connection {i} of {limit} timed out"),
+        }
+    }
+    assert_eq!(stack.live_sockets().0, limit, "all slots should be claimed");
+
+    // One more must be refused, promptly and with a clear error.
+    match stack.connect_tcp(dst).await {
+        Err(e) => {
+            assert_eq!(e.kind(), std::io::ErrorKind::ConnectionRefused);
+            assert!(e.to_string().contains("cap reached"), "unclear error: {e}");
+        }
+        Ok(_) => panic!("the {}th connection must be refused, not allocated", limit + 1),
+    }
+
+    // Closing one frees exactly one slot, so the cap tracks live sockets rather
+    // than a high-water mark.
+    held.pop();
+    for _ in 0..100 {
+        if stack.live_sockets().0 < limit {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(stack.live_sockets().0, limit - 1, "dropping a stream must free its slot");
+    let reclaimed = tokio::time::timeout(Duration::from_secs(10), stack.connect_tcp(dst))
+        .await
+        .expect("timed out reclaiming a freed slot")
+        .expect("a freed slot should be reusable");
+    drop(reclaimed);
+
+    drop(held);
+    drop(tasks);
+}

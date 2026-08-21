@@ -6,6 +6,10 @@
 
 use std::io;
 use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr};
 use tokio_smoltcp::{BufferSize, Net, NetConfig, TcpStream, UdpSocket};
@@ -13,32 +17,53 @@ use tracing::{debug, warn};
 
 use crate::tunnel::{WgDevice, WgTunnel};
 
-/// Per-connection memory. 8 KiB each way is 16 KiB per TCP socket, which is the
-/// dominant term in the tunnel's footprint under load.
+/// Per-connection memory, and the dominant term in the tunnel's footprint.
 ///
-/// These are the throughput/memory knob, and throughput is receive-window
-/// limited, so it scales with the buffer until something else binds. Measured
-/// against a real server (1 MB download, single run each):
+/// Throughput is receive-window limited, so it scales with the buffer until
+/// something else binds -- and what binds first is `QUEUE_DEPTH`, the device
+/// ring. Measured against a real server (1 MB download, three runs each,
+/// Mbit/s):
 ///
-/// |  buffers |    throughput | dropped | per conn |
-/// |----------|---------------|---------|----------|
-/// |   8 KiB  |   3.5 Mbit/s  |       0 |  16 KiB  |
-/// |  16 KiB  |   7.7 Mbit/s  |       0 |  32 KiB  |
-/// |  32 KiB  |  16.1 Mbit/s  |       0 |  64 KiB  |
-/// |  64 KiB  |  14.0 Mbit/s  |      27 | 128 KiB  |
+/// | buffers | ring 32 | ring 64 | ring 128 | ring 256 | per conn |
+/// |---------|---------|---------|----------|----------|----------|
+/// |  8 KiB  |   3.5   |    -    |     -    |     -    |  16 KiB  |
+/// | 16 KiB  |   7.7   |    -    |     -    |     -    |  32 KiB  |
+/// | 32 KiB  |  ~11    |  ~13    |   ~12    |   ~11    |  64 KiB  |
+/// | 64 KiB  |  14 *   |    -    |   ~21    |   ~26    | 128 KiB  |
+/// | 128 KiB |    -    |    -    |     -    |   ~43    | 256 KiB  |
 ///
-/// Note the 64 KiB row: it is *slower* than 32 KiB and drops packets, because a
-/// window that large outruns `QUEUE_DEPTH` packets in the device ring and TCP
-/// backs off. The two constants are coupled -- raising these past 32 KiB
-/// requires raising QUEUE_DEPTH in `tunnel.rs` as well, or the extra memory buys
-/// negative throughput.
+/// (*) 64 KiB on a 32-packet ring was the one configuration that *lost*
+/// throughput and dropped packets: the window outran the ring and TCP backed
+/// off. Raising the ring fixes it entirely -- the buffer was never the problem.
+/// The two constants have to move together.
 ///
-/// ponytail: 8 KiB is the lean default. 32 KiB is the throughput sweet spot at
-/// 4x the per-connection cost; pick per the extension's memory budget.
-const TCP_RX_BUFFER: usize = 8 * 1024;
-const TCP_TX_BUFFER: usize = 8 * 1024;
+/// The chosen point: 64 KiB buffers on a 256-packet ring. The ring costs about
+/// `QUEUE_DEPTH * MTU` once per tunnel (~384 KiB), which is cheap next to
+/// per-connection buffers, and it is what unlocks the scaling. 128 KiB buffers
+/// are measurably faster still, but at 256 KiB per connection the worst case
+/// stops fitting a network extension's budget.
+const TCP_RX_BUFFER: usize = 64 * 1024;
+const TCP_TX_BUFFER: usize = 64 * 1024;
 const UDP_RX_BUFFER: usize = 8 * 1024;
 const UDP_TX_BUFFER: usize = 8 * 1024;
+
+/// Hard ceiling on concurrent in-tunnel sockets.
+///
+/// This is what makes the memory budget bounded rather than merely typical.
+/// leaf will accept as many SOCKS5 CONNECTs as arrive, and each in-tunnel socket
+/// costs `TCP_RX_BUFFER + TCP_TX_BUFFER`; without a cap a connection burst is an
+/// OOM-kill in an extension with a jetsam budget. Refusing the 65th connection
+/// degrades one request. Being killed drops every request and the tunnel.
+///
+/// Worst case here: 64 * 128 KiB = 8 MB, reached only at peak concurrency since
+/// buffers are allocated per live socket and released on close.
+///
+/// ponytail: this is the knob to trade against TCP_*_BUFFER. cap * per-conn is
+/// the number that has to fit the budget.
+pub const MAX_TCP_SOCKETS: usize = 64;
+
+/// UDP sessions are cheaper and shorter-lived, but still bounded.
+pub const MAX_UDP_SOCKETS: usize = 32;
 
 /// Fixed seed material is fine: smoltcp uses `random_seed` to pick initial TCP
 /// sequence numbers, and the tunnel already provides confidentiality and
@@ -56,10 +81,105 @@ fn seed_from(addresses: &[IpAddr]) -> u64 {
     seed
 }
 
+/// Decrements a live-socket counter when dropped, so the cap tracks reality
+/// rather than a high-water mark.
+struct SocketSlot {
+    counter: Arc<AtomicUsize>,
+}
+
+impl SocketSlot {
+    /// Claims a slot, or returns None when the cap is reached.
+    fn claim(counter: &Arc<AtomicUsize>, limit: usize) -> Option<Self> {
+        // compare-exchange rather than fetch_add so a rejected claim never
+        // transiently over-counts and rejects an unrelated concurrent dial.
+        let mut current = counter.load(Ordering::Relaxed);
+        loop {
+            if current >= limit {
+                return None;
+            }
+            match counter.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    return Some(Self {
+                        counter: Arc::clone(counter),
+                    })
+                }
+                Err(actual) => current = actual,
+            }
+        }
+    }
+}
+
+impl Drop for SocketSlot {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// An in-tunnel TCP stream that releases its slot when closed.
+pub struct WgTcpStream {
+    inner: TcpStream,
+    _slot: SocketSlot,
+}
+
+impl tokio::io::AsyncRead for WgTcpStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for WgTcpStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// An in-tunnel UDP socket that releases its slot when closed.
+pub struct WgUdpSocket {
+    inner: UdpSocket,
+    _slot: SocketSlot,
+}
+
+impl WgUdpSocket {
+    pub async fn send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
+        self.inner.send_to(buf, target).await
+    }
+
+    pub async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        self.inner.recv_from(buf).await
+    }
+
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.inner.local_addr()
+    }
+}
+
 pub struct WgStack {
     net: Net,
     /// The source address the stack dials from. See `primary_address`.
     primary: IpAddr,
+    live_tcp: Arc<AtomicUsize>,
+    live_udp: Arc<AtomicUsize>,
 }
 
 /// Pick the address the stack will source packets from.
@@ -138,7 +258,12 @@ impl WgStack {
 
         let net = Net::new(device, config);
         debug!(source = %primary, mtu = tunnel.mtu(), "in-tunnel stack up");
-        Ok(Self { net, primary })
+        Ok(Self {
+            net,
+            primary,
+            live_tcp: Arc::new(AtomicUsize::new(0)),
+            live_udp: Arc::new(AtomicUsize::new(0)),
+        })
     }
 
     /// The address this stack sources packets from.
@@ -160,19 +285,53 @@ impl WgStack {
         ))
     }
 
+    /// Live in-tunnel socket counts, for status reporting and tests.
+    pub fn live_sockets(&self) -> (usize, usize) {
+        (
+            self.live_tcp.load(Ordering::Relaxed),
+            self.live_udp.load(Ordering::Relaxed),
+        )
+    }
+
     /// Open a TCP connection to `dst` from inside the tunnel.
-    pub async fn connect_tcp(&self, dst: SocketAddr) -> io::Result<TcpStream> {
+    ///
+    /// Fails with `ConnectionRefused` once `MAX_TCP_SOCKETS` are live, which
+    /// leaf turns into a failed session -- one degraded request instead of an
+    /// out-of-memory kill that takes the whole tunnel down.
+    pub async fn connect_tcp(&self, dst: SocketAddr) -> io::Result<WgTcpStream> {
         self.check_family(dst.ip())?;
-        self.net.tcp_connect(dst).await
+        let slot = SocketSlot::claim(&self.live_tcp, MAX_TCP_SOCKETS).ok_or_else(|| {
+            warn!(
+                limit = MAX_TCP_SOCKETS,
+                "refusing in-tunnel TCP connect: socket cap reached"
+            );
+            io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                format!("in-tunnel socket cap reached ({MAX_TCP_SOCKETS} live)"),
+            )
+        })?;
+        let inner = self.net.tcp_connect(dst).await?;
+        Ok(WgTcpStream { inner, _slot: slot })
     }
 
     /// Bind a UDP socket inside the tunnel on an ephemeral port.
-    pub async fn bind_udp(&self) -> io::Result<UdpSocket> {
+    pub async fn bind_udp(&self) -> io::Result<WgUdpSocket> {
+        let slot = SocketSlot::claim(&self.live_udp, MAX_UDP_SOCKETS).ok_or_else(|| {
+            warn!(
+                limit = MAX_UDP_SOCKETS,
+                "refusing in-tunnel UDP bind: socket cap reached"
+            );
+            io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                format!("in-tunnel UDP socket cap reached ({MAX_UDP_SOCKETS} live)"),
+            )
+        })?;
         let unspecified = if self.primary.is_ipv4() {
             SocketAddr::from(([0u8, 0, 0, 0], 0))
         } else {
             SocketAddr::from(([0u16; 8], 0))
         };
-        self.net.udp_bind(unspecified).await
+        let inner = self.net.udp_bind(unspecified).await?;
+        Ok(WgUdpSocket { inner, _slot: slot })
     }
 }

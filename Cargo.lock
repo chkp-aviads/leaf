@@ -1667,7 +1667,6 @@ dependencies = [
  "tokio",
  "tokio-openssl",
  "tokio-rustls",
- "tokio-smoltcp",
  "tokio-tungstenite",
  "tokio-util",
  "tracing",

@@ -55,7 +55,7 @@ impl OutboundDatagramHandler for Handler {
 /// clients that match replies against the address they used. leaf's own
 /// `DomainAssociatedOutboundDatagram` preserves the original address the same way.
 struct Datagram {
-    socket: Arc<tokio_smoltcp::UdpSocket>,
+    socket: Arc<wg_netstack::stack::WgUdpSocket>,
     live: Arc<Live>,
     origins: Arc<Mutex<HashMap<SocketAddr, SocksAddr>>>,
 }
@@ -83,7 +83,7 @@ impl OutboundDatagram for Datagram {
 }
 
 struct RecvHalf {
-    socket: Arc<tokio_smoltcp::UdpSocket>,
+    socket: Arc<wg_netstack::stack::WgUdpSocket>,
     origins: Arc<Mutex<HashMap<SocketAddr, SocksAddr>>>,
 }
 
@@ -102,7 +102,7 @@ impl OutboundDatagramRecvHalf for RecvHalf {
 }
 
 struct SendHalf {
-    socket: Arc<tokio_smoltcp::UdpSocket>,
+    socket: Arc<wg_netstack::stack::WgUdpSocket>,
     live: Arc<Live>,
     origins: Arc<Mutex<HashMap<SocketAddr, SocksAddr>>>,
     /// Per-session domain cache, so a chatty UDP flow to a domain does not
