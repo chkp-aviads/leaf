@@ -19,8 +19,12 @@ setup_env() {
         release_flag=
     fi
 
-    export IPHONEOS_DEPLOYMENT_TARGET=10.0
-    export MACOSX_DEPLOYMENT_TARGET=10.12
+    # iOS 10.0 no longer links: aws-lc-sys compiles objects that reference
+    # ___chkstk_darwin, which is absent from that old runtime, so the dylib
+    # crate-type fails with "symbol(s) not found for architecture arm64".
+    # 13.0 matches the minimum Picard itself targets.
+    export IPHONEOS_DEPLOYMENT_TARGET=13.0
+    export MACOSX_DEPLOYMENT_TARGET=10.15
     
     # Output directories
     BASE_DIR="target/apple/$mode"

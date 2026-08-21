@@ -1698,7 +1698,11 @@ dependencies = [
  "anyhow",
  "futures",
  "leaf",
+ "parking_lot",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "wg-netstack",
 ]
 
 [[package]]

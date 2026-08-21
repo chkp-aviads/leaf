@@ -354,12 +354,12 @@ async fn slot_connects_lazily_and_reconnects_after_stop() {
 
     init_tracing();
     let slot = wg_netstack::registry::slot("test-lifecycle");
-    slot.clear().await;
+    slot.clear();
 
     // Configured but untouched: nothing is allocated and status is Down.
     slot.set_config(WgConfig::parse(&peer.client_config(CLIENT_SECRET)).unwrap());
     assert_eq!(
-        slot.status().await.state,
+        slot.status().state,
         TunnelState::Down,
         "a configured but unused slot must not have connected"
     );
@@ -387,8 +387,8 @@ async fn slot_connects_lazily_and_reconnects_after_stop() {
     drop(conn);
     drop(live);
     drop(again);
-    slot.stop().await;
-    assert_eq!(slot.status().await.state, TunnelState::Down);
+    slot.stop();
+    assert_eq!(slot.status().state, TunnelState::Down);
     assert!(slot.is_configured(), "stop must keep the config");
 
     let relive = slot.live().await.expect("should reconnect after stop");
@@ -405,7 +405,7 @@ async fn slot_connects_lazily_and_reconnects_after_stop() {
     let n = conn2.read(&mut buf).await.unwrap();
     assert_eq!(&buf[..n], b"again");
 
-    slot.clear().await;
+    slot.clear();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -414,7 +414,7 @@ async fn reconfiguring_discards_the_old_tunnel() {
     peer.spawn_tcp_echo(ECHO_PORT).await;
 
     let slot = wg_netstack::registry::slot("test-reconfigure");
-    slot.clear().await;
+    slot.clear();
     slot.set_config(WgConfig::parse(&peer.client_config(CLIENT_SECRET)).unwrap());
     let first = slot.live().await.unwrap();
 
@@ -427,7 +427,7 @@ async fn reconfiguring_discards_the_old_tunnel() {
         "set_config must discard the tunnel built from the previous generation"
     );
 
-    slot.clear().await;
+    slot.clear();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -436,7 +436,7 @@ async fn wake_forces_a_rekey_and_traffic_still_flows() {
     peer.spawn_tcp_echo(ECHO_PORT).await;
 
     let slot = wg_netstack::registry::slot("test-wake");
-    slot.clear().await;
+    slot.clear();
     slot.set_config(WgConfig::parse(&peer.client_config(CLIENT_SECRET)).unwrap());
     let live = slot.live().await.unwrap();
     wait_up(&live.tunnel).await;
@@ -461,7 +461,7 @@ async fn wake_forces_a_rekey_and_traffic_still_flows() {
     assert_eq!(&buf[..n], b"post-wake");
     assert_eq!(live.tunnel.status().state, TunnelState::Up);
 
-    slot.clear().await;
+    slot.clear();
 }
 
 /// Many concurrent dials over one tunnel, which is the shape leaf produces:
@@ -539,7 +539,7 @@ async fn reconnect_reusing_the_same_4_tuple_is_refused_by_a_smoltcp_peer() {
     let peer = TestPeer::start(CLIENT_SECRET, PEER_SECRET).await;
     peer.spawn_tcp_echo(ECHO_PORT).await;
     let slot = wg_netstack::registry::slot("test-4tuple");
-    slot.clear().await;
+    slot.clear();
     slot.set_config(WgConfig::parse(&peer.client_config(CLIENT_SECRET)).unwrap());
 
     let dst = SocketAddr::from((PEER_ADDR, ECHO_PORT));
@@ -550,7 +550,7 @@ async fn reconnect_reusing_the_same_4_tuple_is_refused_by_a_smoltcp_peer() {
     let _ = c1.read(&mut buf).await.unwrap();
     drop(c1);
     drop(live);
-    slot.stop().await;
+    slot.stop();
 
     // Same destination, and the fresh stack will reuse local port 10001.
     let relive = slot.live().await.unwrap();
@@ -560,5 +560,5 @@ async fn reconnect_reusing_the_same_4_tuple_is_refused_by_a_smoltcp_peer() {
         "if this now passes, tokio-smoltcp gained port seeding or the peer \
          started accepting TIME_WAIT SYNs -- delete the #[ignore]"
     );
-    slot.clear().await;
+    slot.clear();
 }

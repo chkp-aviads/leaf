@@ -29,7 +29,6 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::PollSender;
 use tracing::{debug, trace, warn};
 
-use crate::clock::{self, Timestamp};
 use crate::config::{WgConfig, MAX_MTU};
 
 /// Every buffer handed to boringtun is this size.
@@ -100,7 +99,6 @@ pub struct WgTunnel {
     dns: Vec<IpAddr>,
     mtu: u16,
     counters: Counters,
-    started: Timestamp,
 }
 
 /// What `decapsulate` produced, with the borrow on the output buffer already
@@ -155,7 +153,6 @@ impl WgTunnel {
             dns: cfg.dns.clone(),
             mtu: cfg.mtu,
             counters: Counters::default(),
-            started: clock::now(),
         });
 
         // inbound: tunnel -> stack. outbound: stack -> tunnel.
@@ -194,12 +191,11 @@ impl WgTunnel {
 
     pub fn status(&self) -> TunnelStatus {
         let (since, tx, rx, _loss, _rtt) = self.tunn.lock().stats();
+        // A live tunnel that has not completed a handshake is Handshaking, not
+        // Down: `Down` means "no tunnel object at all" and is reported by the
+        // registry, which is the only thing that can distinguish the two.
         let state = match since {
             Some(_) => TunnelState::Up,
-            // Distinguish "never handshaked, still trying" from "not started".
-            None if clock::now().saturating_since(self.started) < Duration::from_secs(1) => {
-                TunnelState::Handshaking
-            }
             None => TunnelState::Handshaking,
         };
         TunnelStatus {

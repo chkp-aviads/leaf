@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use parking_lot::Mutex as SyncMutex;
+use parking_lot::{Mutex as SyncMutex, RwLock};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
@@ -46,12 +46,20 @@ pub struct WgSlot {
     key: String,
     /// `None` until `px_wg_set_config` supplies a config.
     config: SyncMutex<Option<Arc<WgConfig>>>,
-    /// Async because it is held across the `connect().await`.
-    live: AsyncMutex<Option<Arc<Live>>>,
+    /// The live tunnel, behind a *sync* lock so status can be read from a
+    /// thread with no tokio runtime -- which is exactly where the C API is
+    /// called from. Connecting is serialised separately by `connecting`.
+    live: RwLock<Option<Arc<Live>>>,
+    /// Held across `connect().await` so two concurrent first-uses do not build
+    /// two tunnels. Never held while touching `live` for a read.
+    connecting: AsyncMutex<()>,
     /// Bumped on every config change, so a stale `Live` is discarded.
     generation: AtomicU64,
     /// The generation the current `Live` was built from.
     live_generation: AtomicU64,
+    /// Captured when a tunnel goes live, so the C API can drive async work
+    /// (DNS, teardown) from a thread that has no runtime of its own.
+    runtime: SyncMutex<Option<tokio::runtime::Handle>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -69,9 +77,11 @@ impl WgSlot {
         Self {
             key,
             config: SyncMutex::new(None),
-            live: AsyncMutex::new(None),
+            live: RwLock::new(None),
+            connecting: AsyncMutex::new(()),
             generation: AtomicU64::new(0),
             live_generation: AtomicU64::new(u64::MAX),
+            runtime: SyncMutex::new(None),
         }
     }
 
@@ -93,29 +103,53 @@ impl WgSlot {
     }
 
     /// Tear the tunnel down but keep the config, so a later use reconnects.
-    pub async fn stop(&self) {
-        if self.live.lock().await.take().is_some() {
+    /// Synchronous: dropping `Live` aborts its tasks and releases every buffer.
+    pub fn stop(&self) {
+        if self.live.write().take().is_some() {
             info!(key = %self.key, "wireguard tunnel stopped");
         }
     }
 
     /// Forget the config too.
-    pub async fn clear(&self) {
-        self.stop().await;
+    pub fn clear(&self) {
+        self.stop();
         *self.config.lock() = None;
+    }
+
+    /// A runtime handle captured when the tunnel came up, for callers that have
+    /// no runtime of their own (the C API).
+    pub fn runtime(&self) -> Option<tokio::runtime::Handle> {
+        self.runtime.lock().clone()
+    }
+
+    /// The live tunnel if there is one, without connecting. Sync and cheap.
+    pub fn current(&self) -> Option<Arc<Live>> {
+        let wanted = self.generation.load(Ordering::SeqCst);
+        if self.live_generation.load(Ordering::SeqCst) != wanted {
+            return None;
+        }
+        self.live.read().clone()
     }
 
     /// Get the live tunnel, connecting on first use.
     pub async fn live(&self) -> Result<Arc<Live>, SlotError> {
         let wanted = self.generation.load(Ordering::SeqCst);
-        let mut guard = self.live.lock().await;
 
-        // Discard a tunnel built from a superseded config.
-        if self.live_generation.load(Ordering::SeqCst) != wanted {
-            guard.take();
+        // Fast path: no lock contention for the common case.
+        if let Some(live) = self.current() {
+            return Ok(live);
         }
-        if let Some(live) = guard.as_ref() {
-            return Ok(Arc::clone(live));
+
+        // Slow path. Serialise connects so a burst of first-use requests
+        // builds one tunnel rather than one each.
+        let _connecting = self.connecting.lock().await;
+        if let Some(live) = self.current() {
+            return Ok(live);
+        }
+        // A superseded tunnel is dropped here, releasing its buffers before we
+        // allocate the replacement.
+        if self.live_generation.load(Ordering::SeqCst) != wanted {
+            self.live.write().take();
         }
 
         let cfg = self
@@ -131,16 +165,18 @@ impl WgSlot {
             stack,
             tasks,
         });
+        *self.runtime.lock() = Some(tokio::runtime::Handle::current());
         self.live_generation.store(wanted, Ordering::SeqCst);
-        *guard = Some(Arc::clone(&live));
+        *self.live.write() = Some(Arc::clone(&live));
         info!(key = %self.key, "wireguard tunnel up");
         Ok(live)
     }
 
-    /// Status without forcing a connection: a slot that has never been used
-    /// reports `Down`, which is what `px_wg_get_status` should say.
-    pub async fn status(&self) -> TunnelStatus {
-        match self.live.lock().await.as_ref() {
+    /// Status without forcing a connection, and without needing a runtime: a
+    /// slot that has never been used reports `Down`, which is what
+    /// `px_wg_get_status` should say.
+    pub fn status(&self) -> TunnelStatus {
+        match self.current() {
             Some(live) => live.tunnel.status(),
             None => TunnelStatus {
                 state: TunnelState::Down,
@@ -156,8 +192,7 @@ impl WgSlot {
     /// which does not advance across suspend, so we do not trust its notion of
     /// handshake age — we force a fresh one.
     pub async fn wake(&self) {
-        let live = self.live.lock().await.as_ref().map(Arc::clone);
-        match live {
+        match self.current() {
             Some(live) => {
                 debug!(key = %self.key, "forcing rekey after wake");
                 live.tunnel.begin_handshake(true).await;
@@ -197,10 +232,10 @@ pub fn keys() -> Vec<String> {
 /// Drop every tunnel but keep the configs. Used by `px_trim_memory` under
 /// memory pressure: an idle tunnel's smoltcp buffers are the largest thing we
 /// can hand back, and the next request transparently reconnects.
-pub async fn stop_all() {
+pub fn stop_all() {
     let slots: Vec<Arc<WgSlot>> = registry().lock().values().map(Arc::clone).collect();
     for slot in slots {
-        slot.stop().await;
+        slot.stop();
     }
 }
 
@@ -235,7 +270,7 @@ mod tests {
     async fn unconfigured_slot_reports_down_and_refuses_to_connect() {
         let s = slot("test-unconfigured");
         assert!(!s.is_configured());
-        assert_eq!(s.status().await.state, TunnelState::Down);
+        assert_eq!(s.status().state, TunnelState::Down);
         match s.live().await {
             Err(SlotError::NotConfigured(k)) => assert_eq!(k, "test-unconfigured"),
             Err(e) => panic!("wrong error: {e}"),
@@ -258,7 +293,7 @@ mod tests {
         assert!(s.is_configured());
         s.set_config(cfg);
         assert_eq!(s.generation.load(Ordering::SeqCst), 2);
-        s.clear().await;
+        s.clear();
         assert!(!s.is_configured());
     }
 
