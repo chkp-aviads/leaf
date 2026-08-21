@@ -4,6 +4,7 @@ members = [
     "leaf-cli",
     "leaf-ffi",
     "leaf-plugins/shadowsocks",
+    "wg-netstack",
 ]
 default-members = ["leaf-cli"]
 resolver = "2"
