@@ -50,6 +50,11 @@ const TIMER_TICK: Duration = Duration::from_millis(250);
 
 /// Bounded queues in both directions. IP is a lossy medium, so a full inbound
 /// queue drops packets exactly as a full NIC ring would.
+///
+/// Coupled to the TCP buffer sizes in `stack.rs`: a receive window larger than
+/// this many packets can outrun the ring, and the resulting drops make TCP back
+/// off -- measurably *reducing* throughput. 32 packets pairs with TCP buffers up
+/// to 32 KiB; raise both together or neither.
 const QUEUE_DEPTH: usize = 32;
 
 pub type Packet = Vec<u8>;

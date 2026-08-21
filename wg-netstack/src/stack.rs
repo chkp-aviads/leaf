@@ -16,8 +16,25 @@ use crate::tunnel::{WgDevice, WgTunnel};
 /// Per-connection memory. 8 KiB each way is 16 KiB per TCP socket, which is the
 /// dominant term in the tunnel's footprint under load.
 ///
-/// ponytail: these are the throughput/memory knob. Raise `tcp_*_size` if
-/// bandwidth disappoints on a fast link; the cost is linear in live connections.
+/// These are the throughput/memory knob, and throughput is receive-window
+/// limited, so it scales with the buffer until something else binds. Measured
+/// against a real server (1 MB download, single run each):
+///
+/// |  buffers |    throughput | dropped | per conn |
+/// |----------|---------------|---------|----------|
+/// |   8 KiB  |   3.5 Mbit/s  |       0 |  16 KiB  |
+/// |  16 KiB  |   7.7 Mbit/s  |       0 |  32 KiB  |
+/// |  32 KiB  |  16.1 Mbit/s  |       0 |  64 KiB  |
+/// |  64 KiB  |  14.0 Mbit/s  |      27 | 128 KiB  |
+///
+/// Note the 64 KiB row: it is *slower* than 32 KiB and drops packets, because a
+/// window that large outruns `QUEUE_DEPTH` packets in the device ring and TCP
+/// backs off. The two constants are coupled -- raising these past 32 KiB
+/// requires raising QUEUE_DEPTH in `tunnel.rs` as well, or the extra memory buys
+/// negative throughput.
+///
+/// ponytail: 8 KiB is the lean default. 32 KiB is the throughput sweet spot at
+/// 4x the per-connection cost; pick per the extension's memory budget.
 const TCP_RX_BUFFER: usize = 8 * 1024;
 const TCP_TX_BUFFER: usize = 8 * 1024;
 const UDP_RX_BUFFER: usize = 8 * 1024;
