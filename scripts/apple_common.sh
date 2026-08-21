@@ -83,8 +83,11 @@ generate_header() {
         --config "$package/cbindgen.toml" \
         "$package/src/lib.rs" > "$INCLUDE_DIR/$name.h"
 
+    # Module name deliberately differs from the library name: "leaf" as a Swift
+    # module would shadow nothing useful and reads oddly at the import site.
+    # LeafFFI matches the SwiftPM binaryTarget that consumes it.
     cat << EOF > "$INCLUDE_DIR/module.modulemap"
-module $name {
+module LeafFFI {
     header "$name.h"
     export *
 }
