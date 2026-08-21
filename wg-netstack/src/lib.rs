@@ -14,5 +14,13 @@
 
 pub mod clock;
 pub mod config;
+pub mod registry;
+pub mod resolve;
+pub mod stack;
+pub mod tunnel;
 
 pub use config::{ConfigError, Key, PeerConfig, WgConfig};
+pub use registry::{Live, SlotError, WgSlot};
+pub use resolve::{HostRecord, ResolveError};
+pub use stack::WgStack;
+pub use tunnel::{TunnelError, TunnelState, TunnelStatus, WgDevice, WgTunnel};
