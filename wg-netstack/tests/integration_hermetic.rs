@@ -7,7 +7,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
-mod harness;
+use wg_netstack::testpeer as harness;
 
 /// Opt-in tracing: `RUST_LOG=debug cargo test ... -- --nocapture`
 fn init_tracing() {

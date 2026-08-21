@@ -63,6 +63,11 @@ message SocksInboundSettings {
 	string password = 2;
 }
 
+message HttpInboundSettings {
+	string username = 1;
+	string password = 2;
+}
+
 message ShadowsocksInboundSettings {
 	string method = 1;
 	string password = 2;
@@ -196,6 +201,13 @@ message QuicOutboundSettings {
 	string certificate = 4;
 	repeated string alpn = 5;
 	string certificate_key = 6;
+}
+
+message WireGuardOutboundSettings {
+	// Identifies the tunnel in wg-netstack's registry. The wg-quick config
+	// itself is supplied at runtime over the C API, so no key material ever
+	// appears in a leaf config.
+	string control_key = 1;
 }
 
 message VMessOutboundSettings {

@@ -1667,6 +1667,7 @@ dependencies = [
  "tokio",
  "tokio-openssl",
  "tokio-rustls",
+ "tokio-smoltcp",
  "tokio-tungstenite",
  "tokio-util",
  "tracing",
@@ -1678,6 +1679,7 @@ dependencies = [
  "uuid",
  "webpki-roots 0.25.4",
  "webpki-roots 0.26.11",
+ "wg-netstack",
 ]
 
 [[package]]
@@ -3600,6 +3602,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "wg-netstack",
 ]
 
 [[package]]

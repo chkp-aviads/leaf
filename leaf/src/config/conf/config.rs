@@ -1009,7 +1009,9 @@ pub fn to_common(conf: &Config) -> Result<common::Config> {
                 tag: Some("http".to_string()),
                 address: Some(interface.clone()),
                 port: Some(*port),
-                settings: common::InboundSettings::Http,
+                // The .conf format has no auth fields; Picard uses the JSON
+                // format, where credentials are configurable.
+                settings: common::InboundSettings::Http { settings: None },
             });
         }
 

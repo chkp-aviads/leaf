@@ -62,6 +62,8 @@ pub mod nf;
 pub mod obfs;
 #[cfg(any(feature = "inbound-quic", feature = "outbound-quic"))]
 pub mod quic;
+#[cfg(feature = "outbound-wireguard")]
+pub mod wireguard;
 #[cfg(feature = "outbound-reality")]
 pub mod reality;
 #[cfg(feature = "outbound-redirect")]

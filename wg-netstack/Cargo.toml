@@ -5,6 +5,11 @@ edition = "2021"
 license = "Apache-2.0"
 description = "Userspace WireGuard tunnel with a dial-capable TCP/IP stack, for leaf's wireguard outbound."
 
+[features]
+# A hand-rolled WireGuard peer used by this crate's integration tests and by
+# leaf's. Deliberately not default: it must never reach a shipped build.
+test-harness = []
+
 [dependencies]
 # WireGuard Noise state machine only. We supply the socket, the netstack and the
 # clock ourselves, so `device`/`ffi`/`jni` stay off.
@@ -31,5 +36,6 @@ thiserror = "1.0"
 libc = "0.2"
 
 [dev-dependencies]
+wg-netstack = { path = ".", features = ["test-harness"] }
 tokio = { version = "1", features = ["full"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

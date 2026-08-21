@@ -37,6 +37,8 @@ use crate::proxy::obfs;
 use crate::proxy::quic;
 #[cfg(feature = "outbound-reality")]
 use crate::proxy::reality;
+#[cfg(feature = "outbound-wireguard")]
+use crate::proxy::wireguard;
 #[cfg(feature = "outbound-redirect")]
 use crate::proxy::redirect;
 #[cfg(feature = "outbound-shadowsocks")]
@@ -383,6 +385,28 @@ impl OutboundManager {
                     HandlerBuilder::default()
                         .tag(tag.clone())
                         .stream_handler(stream)
+                        .build()
+                }
+                #[cfg(feature = "outbound-wireguard")]
+                "wireguard" => {
+                    let settings =
+                        config::WireGuardOutboundSettings::parse_from_bytes(&outbound.settings)
+                            .map_err(|e| anyhow!("invalid [{}] outbound settings: {}", &tag, e))?;
+                    let control_key = if settings.control_key.is_empty() {
+                        "default".to_string()
+                    } else {
+                        settings.control_key.clone()
+                    };
+                    // Both halves: unlike quic, this outbound must carry UDP as
+                    // well, because Picard uses SOCKS5 UDP ASSOCIATE over it.
+                    let stream = Arc::new(wireguard::outbound::StreamHandler {
+                        control_key: control_key.clone(),
+                    });
+                    let datagram = Arc::new(wireguard::outbound::DatagramHandler { control_key });
+                    HandlerBuilder::default()
+                        .tag(tag.clone())
+                        .stream_handler(stream)
+                        .datagram_handler(datagram)
                         .build()
                 }
                 _ => continue,

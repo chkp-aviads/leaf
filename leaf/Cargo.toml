@@ -81,6 +81,7 @@ all-endpoints = [
     "outbound-amux",
     "outbound-vmess",
     "outbound-quic",
+    "outbound-wireguard",
     "outbound-failover",
     "outbound-static",
     "outbound-tryall",
@@ -125,6 +126,7 @@ outbound-vless = ["hex"]
 outbound-reality = ["reality", "reality-rustls", "webpki-roots", "rustls-pemfile", "hex", "base64"]
 outbound-amux= ["tokio-util"]
 outbound-quic = ["rustls", "webpki-roots-old", "rustls-pemfile-old"]
+outbound-wireguard = ["wg-netstack", "tokio-smoltcp"]
 outbound-mptp = []
 outbound-select = ["directories", "axum/query"]
 outbound-vmess = ["lz_fnv", "cfb-mode", "hmac", "sha2", "aes", "aes-gcm", "sha3", "digest", "md-5", "tokio-util", "byteorder", "crc32fast"]
@@ -134,7 +136,7 @@ inbound-trojan = ["sha2", "hex"]
 inbound-mptp = []
 inbound-shadowsocks = ["hkdf", "sha-1", "md-5", "tokio-util"]
 inbound-socks = []
-inbound-http = ["http"]
+inbound-http = ["http", "base64"]
 inbound-hc = []
 inbound-tun = ["tun", "netstack-lwip", "netstack-smoltcp", "pnet_datalink"]
 inbound-ws = ["tungstenite", "tokio-tungstenite", "url", "http"]
@@ -272,6 +274,8 @@ notify = { version = "6", optional = true }
 # TUN
 tun = { version = "0.7", features = ["async"], optional = true  }
 netstack-lwip = { git = "https://github.com/eycorsican/netstack-lwip", rev = "4cc3162", optional = true }
+wg-netstack = { path = "../wg-netstack", optional = true }
+tokio-smoltcp = { version = "0.6", default-features = false, features = ["proto-ipv4", "proto-ipv6"], optional = true }
 netstack-smoltcp = { git = "https://github.com/eycorsican/netstack-smoltcp", branch = "pr-16-initialize-unfilled", optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
@@ -289,6 +293,7 @@ libc = "0.2"
 memchr = { version = "2" }
 
 [dev-dependencies]
+wg-netstack = { path = "../wg-netstack", features = ["test-harness"] }
 rcgen = "0.13"
 sha2 = "0.10"
 tokio = { version = "1", features = ["fs", "sync", "io-util", "net", "time", "rt", "rt-multi-thread"] }

@@ -45,6 +45,34 @@ use super::cat_listener::CatInboundListener;
 #[cfg(feature = "inbound-tun")]
 use super::tun_listener::TunInboundListener;
 
+/// Validate a configured username/password pair.
+///
+/// Both-or-neither is the only sane shape, and enforcing it here fixes a real
+/// crash rather than a cosmetic one: `socks::inbound::StreamHandler` advertises
+/// method 0x02 whenever a username is present and then unwraps the password on
+/// the first authenticating client. Under the release profile's
+/// `panic = "abort"` that takes down the whole network extension, from config
+/// a user could plausibly write.
+///
+/// Checked once here so every inbound that grows credentials inherits it,
+/// instead of each call site having to remember.
+fn normalize_credentials(
+    tag: &str,
+    username: String,
+    password: String,
+) -> Result<(Option<String>, Option<String>)> {
+    match (username.is_empty(), password.is_empty()) {
+        (true, true) => Ok((None, None)),
+        (false, false) => Ok((Some(username), Some(password))),
+        (false, true) => Err(anyhow!(
+            "inbound [{tag}] sets username but not password; both or neither are required"
+        )),
+        (true, false) => Err(anyhow!(
+            "inbound [{tag}] sets password but not username; both or neither are required"
+        )),
+    }
+}
+
 pub struct InboundManager {
     network_listeners: HashMap<String, NetworkInboundListener>,
     #[cfg(feature = "inbound-tun")]
@@ -67,25 +95,17 @@ impl InboundManager {
             match inbound.protocol.as_str() {
                 #[cfg(feature = "inbound-socks")]
                 "socks" => {
-                    let mut username = None;
-                    let mut password = None;
-                    if !inbound.settings.is_empty() {
-                        let settings =
-                            config::SocksInboundSettings::parse_from_bytes(&inbound.settings)
-                                .map_err(|e| {
-                                    anyhow!("invalid [{}] inbound settings: {}", &tag, e)
-                                })?;
-                        username = if settings.username.is_empty() {
-                            None
-                        } else {
-                            Some(settings.username)
-                        };
-                        password = if settings.password.is_empty() {
-                            None
-                        } else {
-                            Some(settings.password)
-                        };
-                    }
+                    let settings = if inbound.settings.is_empty() {
+                        config::SocksInboundSettings::default()
+                    } else {
+                        config::SocksInboundSettings::parse_from_bytes(&inbound.settings)
+                            .map_err(|e| anyhow!("invalid [{}] inbound settings: {}", &tag, e))?
+                    };
+                    let (username, password) = normalize_credentials(
+                        &tag,
+                        settings.username.clone(),
+                        settings.password.clone(),
+                    )?;
                     let stream = Arc::new(socks::inbound::StreamHandler { username, password });
                     let datagram = Arc::new(socks::inbound::DatagramHandler);
                     let handler = Arc::new(proxy::inbound::Handler::new(
@@ -97,7 +117,15 @@ impl InboundManager {
                 }
                 #[cfg(feature = "inbound-http")]
                 "http" => {
-                    let stream = Arc::new(http::inbound::StreamHandler);
+                    let settings =
+                        config::HttpInboundSettings::parse_from_bytes(&inbound.settings)
+                            .unwrap_or_default();
+                    let (username, password) = normalize_credentials(
+                        &tag,
+                        settings.username.clone(),
+                        settings.password.clone(),
+                    )?;
+                    let stream = Arc::new(http::inbound::StreamHandler { username, password });
                     let handler = Arc::new(proxy::inbound::Handler::new(
                         tag.clone(),
                         Some(stream),

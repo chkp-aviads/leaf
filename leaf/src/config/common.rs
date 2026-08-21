@@ -41,6 +41,13 @@ pub struct NfInboundSettings {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(deny_unknown_fields)]
+pub struct HttpInboundSettings {
+    pub username: Option<String>,
+    pub password: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct SocksInboundSettings {
     pub username: Option<String>,
     pub password: Option<String>,
@@ -251,6 +258,16 @@ pub struct AMuxOutboundSettings {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct WireGuardOutboundSettings {
+    /// Identifies the tunnel in wg-netstack's registry. The wg-quick config is
+    /// supplied separately at runtime over the C API, so no key material ever
+    /// appears in a leaf config file.
+    #[serde(rename = "controlKey", alias = "control_key")]
+    pub control_key: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct QuicOutboundSettings {
     pub address: Option<String>,
     pub port: Option<u16>,
@@ -392,7 +409,10 @@ pub enum InboundSettings {
         #[serde(default)]
         settings: Option<SocksInboundSettings>,
     },
-    Http,
+    Http {
+        #[serde(default)]
+        settings: Option<HttpInboundSettings>,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -461,6 +481,10 @@ pub enum OutboundSettings {
     Quic {
         #[serde(default)]
         settings: Option<QuicOutboundSettings>,
+    },
+    WireGuard {
+        #[serde(default)]
+        settings: Option<WireGuardOutboundSettings>,
     },
     Chain {
         #[serde(default)]
@@ -763,8 +787,21 @@ pub fn to_internal(mut config: Config) -> Result<internal::Config> {
                     }
                     inbounds.push(inbound);
                 }
-                InboundSettings::Http => {
+                InboundSettings::Http {
+                    settings: ext_settings,
+                } => {
                     inbound.protocol = "http".to_string();
+                    if let Some(ext_settings) = ext_settings {
+                        let mut settings = internal::HttpInboundSettings::new();
+                        if let Some(ext_username) = &ext_settings.username {
+                            settings.username = ext_username.clone();
+                        }
+                        if let Some(ext_password) = &ext_settings.password {
+                            settings.password = ext_password.clone();
+                        }
+                        let settings = settings.write_to_bytes().unwrap();
+                        inbound.settings = settings;
+                    }
                     inbounds.push(inbound);
                 }
                 InboundSettings::Shadowsocks {
@@ -1400,6 +1437,21 @@ pub fn to_internal(mut config: Config) -> Result<internal::Config> {
                         let settings = settings.write_to_bytes().unwrap();
                         outbound.settings = settings;
                     }
+                    outbounds.push(outbound);
+                }
+                OutboundSettings::WireGuard {
+                    settings: ext_settings,
+                } => {
+                    outbound.protocol = "wireguard".to_string();
+                    let mut settings = internal::WireGuardOutboundSettings::new();
+                    // Default so a config may omit it entirely when there is
+                    // only one tunnel, which is the common case.
+                    settings.control_key = ext_settings
+                        .as_ref()
+                        .and_then(|s| s.control_key.clone())
+                        .unwrap_or_else(|| "default".to_string());
+                    let settings = settings.write_to_bytes().unwrap();
+                    outbound.settings = settings;
                     outbounds.push(outbound);
                 }
                 OutboundSettings::Chain {

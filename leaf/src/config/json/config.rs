@@ -6,14 +6,15 @@ use crate::config::{common, internal};
 
 pub use crate::config::common::{
     AMuxInboundSettings, AMuxOutboundSettings, CatInboundSettings, ChainInboundSettings,
-    ChainOutboundSettings, Config, Dns, FailOverOutboundSettings, HcInboundSettings, Inbound,
+    ChainOutboundSettings, Config, Dns, FailOverOutboundSettings, HcInboundSettings,
+    HttpInboundSettings, Inbound,
     InboundSettings, Log, NfInboundSettings, ObfsOutboundSettings, Outbound, OutboundSettings,
     PluginOutboundSettings, QuicInboundSettings, QuicOutboundSettings, RealityOutboundSettings,
     RedirectOutboundSettings, Rule, SelectOutboundSettings, ShadowsocksInboundSettings,
     ShadowsocksOutboundSettings, SocksOutboundSettings, StaticOutboundSettings, TlsInboundSettings,
     TlsOutboundSettings, TrojanInboundSettings, TrojanOutboundSettings, TryAllOutboundSettings,
     TunInboundSettings, VMessOutboundSettings, VlessOutboundSettings, WebSocketInboundSettings,
-    WebSocketOutboundSettings,
+    WebSocketOutboundSettings, WireGuardOutboundSettings,
 };
 
 pub fn to_internal(config: Config) -> Result<internal::Config> {

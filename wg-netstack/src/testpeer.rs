@@ -1,5 +1,10 @@
 //! An in-process WireGuard peer, for hermetic integration tests.
 //!
+//! Lives in the library rather than a `tests/` directory because two crates
+//! need it: `wg-netstack`'s own integration tests and leaf's
+//! `test_wireguard`. Gated behind the non-default `test-harness` feature, so
+//! none of it reaches a shipped build.
+//!
 //! This is deliberately a *separate* implementation from `wg_netstack::tunnel`:
 //! if both sides shared the production code, a symmetric bug (wrong nonce
 //! handling, a missed drain loop) would cancel out and the test would pass.

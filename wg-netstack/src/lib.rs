@@ -17,6 +17,10 @@ pub mod config;
 pub mod registry;
 pub mod resolve;
 pub mod stack;
+
+/// In-process WireGuard peer for tests. Never compiled into a shipped build.
+#[cfg(feature = "test-harness")]
+pub mod testpeer;
 pub mod tunnel;
 
 pub use config::{ConfigError, Key, PeerConfig, WgConfig};

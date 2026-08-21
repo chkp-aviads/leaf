@@ -23,6 +23,26 @@ fn bad_request() -> io::Error {
     io::Error::other("bad request")
 }
 
+fn unauthorized() -> io::Error {
+    io::Error::other("proxy authentication required")
+}
+
+/// Constant-time comparison, so a wrong password cannot be recovered by timing
+/// the 407. wireproxy used `subtle.ConstantTimeCompare` here for the same reason.
+fn secret_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    // Length is not secret (it leaks through the encoded credential anyway),
+    // but the content comparison must not short-circuit.
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for i in 0..a.len() {
+        diff |= a[i] ^ b[i];
+    }
+    diff == 0
+}
+
 fn split_slice_once(s: &[u8], sep: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
     s.windows(sep.len())
         .position(|w| w == sep)
@@ -96,6 +116,13 @@ impl RequestHead {
         Ok(headers)
     }
 
+    fn get_header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+
     fn set_header(&mut self, name: String, value: String) {
         for (i, (n, _v)) in self.headers.iter().enumerate() {
             if n.to_lowercase() == name.to_lowercase() {
@@ -150,12 +177,16 @@ struct HttpStream {
     cache: Vec<u8>,
     destination: Option<SocksAddr>,
     origin: AnyStream,
+    username: Option<String>,
+    password: Option<String>,
 }
 
 impl HttpStream {
     async fn sniff(&mut self) -> io::Result<()> {
         let (head_buf, mut rest_buf) = self.drain(&EOH).await?;
         let mut head = RequestHead::try_from(head_buf)?;
+
+        self.authenticate(&head).await?;
 
         let addr = SocksAddr::try_from(&head.uri)?;
         self.destination = Some(addr.clone());
@@ -188,6 +219,49 @@ impl HttpStream {
             }
             _ => Err(bad_request()),
         }
+    }
+
+    /// RFC 7235 Basic proxy auth. A no-op when no credentials are configured,
+    /// which keeps the existing unauthenticated behaviour intact.
+    async fn authenticate(&mut self, head: &RequestHead) -> io::Result<()> {
+        let (Some(username), Some(password)) = (self.username.as_ref(), self.password.as_ref())
+        else {
+            return Ok(());
+        };
+
+        let presented = head
+            .get_header("proxy-authorization")
+            .and_then(|v| v.trim().strip_prefix("Basic ").map(str::trim))
+            .and_then(|b64| {
+                base64::engine::Engine::decode(
+                    &base64::engine::general_purpose::STANDARD,
+                    b64.as_bytes(),
+                )
+                .ok()
+            })
+            .and_then(|raw| String::from_utf8(raw).ok());
+
+        let ok = match presented.as_deref().and_then(|c| c.split_once(':')) {
+            Some((u, p)) => secret_eq(u, username) && secret_eq(p, password),
+            None => false,
+        };
+
+        if ok {
+            return Ok(());
+        }
+
+        // Challenge the client rather than dropping the connection, so a proxy
+        // client can retry with credentials.
+        let _ = self
+            .origin
+            .write_all(
+                b"HTTP/1.1 407 Proxy Authentication Required\r\n\
+                  Proxy-Authenticate: Basic realm=\"Proxy\"\r\n\
+                  Content-Length: 0\r\n\
+                  Connection: close\r\n\r\n",
+            )
+            .await;
+        Err(unauthorized())
     }
 
     async fn drain(&mut self, stop_sign: &[u8]) -> io::Result<(Vec<u8>, Vec<u8>)> {
@@ -239,7 +313,10 @@ impl AsyncWrite for HttpStream {
     }
 }
 
-pub struct Handler;
+pub struct Handler {
+    pub username: Option<String>,
+    pub password: Option<String>,
+}
 
 #[async_trait]
 impl InboundStreamHandler for Handler {
@@ -253,6 +330,8 @@ impl InboundStreamHandler for Handler {
             cache: Vec::new(),
             destination: None,
             origin: stream,
+            username: self.username.clone(),
+            password: self.password.clone(),
         };
         http_stream.sniff().await?;
 
