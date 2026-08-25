@@ -27,8 +27,8 @@
 import Foundation
 import PackageDescription
 
-let version = "0.1.0"
-let checksum = "99715622f5d1dd665b6b36f3ea52facfeec19accd78fd16e2305ff26688fa8a1"
+let version = "1.0.0"
+let checksum = "e99dd61f8d1ab5f4f798b88fa8945ab3ce0038ac59c7df92c499625791ccffb5"
 
 let useLocalBinary = ProcessInfo.processInfo.environment["LEAF_LOCAL_XCFRAMEWORK"] != nil
 

@@ -14,6 +14,33 @@ default = [
     "default-aws-lc"
 ]
 
+# The minimum Picard needs. Two leaf instances:
+#   1. tun inbound (the device's utun)  -> socks outbound (Picard's proxy)
+#   2. socks + http inbounds            -> wireguard outbound
+#
+# Everything else in all-endpoints -- shadowsocks, vmess, vless, trojan, quic,
+# reality, obfs, amux, mptp, chain, tryall, failover, redirect, cat, nf, plugin
+# -- is unused here. Excluding it shrinks the shipped artifact substantially and,
+# in a security product, removes a large amount of unused protocol-parsing code
+# from the attack surface.
+#
+# Also deliberately absent:
+#   api        an axum HTTP control server, which pulls in the whole hyper/tower
+#              stack and has no business inside a network extension
+#   config-conf  px_start parses JSON explicitly; the .conf parser is unreachable
+#   rustls/quinn/aead backends  only TLS-bearing protocols need them, and none
+#              of the above are enabled. DoH in leaf's DNS client degrades to a
+#              clear error rather than failing to compile.
+picard = [
+    "config-json",
+    "inbound-tun",
+    "inbound-socks",
+    "inbound-http",
+    "outbound-socks",
+    "outbound-direct",
+    "outbound-wireguard",
+]
+
 default-ring = [
     "all-configs",
     "all-endpoints",

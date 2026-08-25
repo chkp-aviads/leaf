@@ -41,8 +41,8 @@ build_macos_libs() {
     rustup target add x86_64-apple-darwin
     rustup target add aarch64-apple-darwin
 
-    cargo build -p $package $release_flag --no-default-features --features "default-aws-lc" --target x86_64-apple-darwin
-    cargo build -p $package $release_flag --no-default-features --features "default-aws-lc" --target aarch64-apple-darwin
+    cargo build -p $package $release_flag --no-default-features --features "picard" --target x86_64-apple-darwin
+    cargo build -p $package $release_flag --no-default-features --features "picard" --target aarch64-apple-darwin
 
     mkdir -p "$BASE_DIR/macos"
 
@@ -57,9 +57,9 @@ build_ios_libs() {
     rustup target add x86_64-apple-ios
     rustup target add aarch64-apple-ios-sim
 
-    cargo build -p $package $release_flag --no-default-features --features "default-aws-lc" --target aarch64-apple-ios
-    cargo build -p $package $release_flag --no-default-features --features "default-aws-lc" --target x86_64-apple-ios
-    cargo build -p $package $release_flag --no-default-features --features "default-aws-lc" --target aarch64-apple-ios-sim
+    cargo build -p $package $release_flag --no-default-features --features "picard" --target aarch64-apple-ios
+    cargo build -p $package $release_flag --no-default-features --features "picard" --target x86_64-apple-ios
+    cargo build -p $package $release_flag --no-default-features --features "picard" --target aarch64-apple-ios-sim
 
     mkdir -p "$BASE_DIR/ios"
     mkdir -p "$BASE_DIR/ios-sim"

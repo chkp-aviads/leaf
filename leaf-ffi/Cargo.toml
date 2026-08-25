@@ -19,6 +19,11 @@ default-aws-lc= [
     "leaf/default-aws-lc",
 ]
 
+# What Picard actually ships. See the `picard` feature in leaf/Cargo.toml.
+picard = [
+    "leaf/picard",
+]
+
 default-ring = [
     "leaf/default-ring",
 ]
