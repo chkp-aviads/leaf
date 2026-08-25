@@ -538,6 +538,17 @@ pub fn new(
     let mut cfg = tun::Configuration::default();
     if settings.fd >= 0 {
         cfg.raw_fd(settings.fd);
+        // The descriptor belongs to the caller, not to us.
+        //
+        // `tun` defaults `close_fd_on_drop` to true (platform/ios/device.rs),
+        // so dropping the device closes the fd we were handed. On iOS that fd
+        // is the NetworkExtension's utun: closing it destroys the system
+        // tunnel, and the next start finds no utun to attach to. The Go
+        // libraries this replaced avoided the same trap by dup()ing the fd
+        // before use (tun2socks.go openTunInterfaceByFd, api-apple.go
+        // wgTurnOn); opting out of the close is the same contract without the
+        // extra descriptor.
+        cfg.close_fd_on_drop(false);
     } else if settings.auto {
         cfg.tun_name(&*option::DEFAULT_TUN_NAME)
             .address(&*option::DEFAULT_TUN_IPV4_ADDR)
