@@ -58,3 +58,12 @@ Icon
 Network Trash Folder
 Temporary Items
 .apdisk
+
+# SwiftPM distribution artifacts. Built by scripts/package_spm.sh and attached
+# to a GitHub release; never committed.
+*.xcframework
+*.xcframework.zip
+
+# SwiftPM scratch directory (this repo is a Rust workspace that also ships a
+# Package.swift, so both /target and /.build appear here).
+/.build
