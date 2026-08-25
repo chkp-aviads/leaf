@@ -34,6 +34,18 @@ default = [
 picard = [
     "config-json",
     "inbound-tun",
+    # smoltcp rather than lwIP, and only one of them.
+    #
+    # This stack parses raw IP packets straight off the device's TUN, the most
+    # hostile input surface in the product, and lwIP is C with a CVE history.
+    # Pure Rust is worth more here than lwIP's longer track record -- which is a
+    # real trade, since lwIP is leaf's default and is what the Go tun2socks this
+    # replaced used, so it has the field mileage and smoltcp does not.
+    #
+    # Excluding lwIP saves only ~2 MB; the point is not shipping a C TCP/IP
+    # stack we never execute. It does NOT remove cc/bindgen from the build --
+    # leaf's own build.rs uses both for the mobile bindings and proto codegen.
+    "netstack-smoltcp",
     "inbound-socks",
     "inbound-http",
     "outbound-socks",
@@ -94,6 +106,8 @@ all-endpoints = [
     "inbound-shadowsocks",
     "inbound-socks",
     "inbound-tun",
+    "netstack-lwip",
+    "netstack-smoltcp",
     "inbound-cat",
     # outbounds
     "outbound-direct",
@@ -165,7 +179,11 @@ inbound-shadowsocks = ["hkdf", "sha-1", "md-5", "tokio-util"]
 inbound-socks = []
 inbound-http = ["http", "base64"]
 inbound-hc = []
-inbound-tun = ["tun", "netstack-lwip", "netstack-smoltcp", "pnet_datalink"]
+# The tun device plumbing only. A netstack backend must be selected alongside
+# it -- "netstack-lwip" and/or "netstack-smoltcp", the implicit features their
+# optional dependencies create. Splitting them lets a build ship one backend
+# instead of compiling both and executing one.
+inbound-tun = ["tun", "pnet_datalink"]
 inbound-ws = ["tungstenite", "tokio-tungstenite", "url", "http"]
 inbound-amux = ["tokio-util"]
 inbound-quic = ["rustls", "rustls-pemfile-old"]
@@ -302,7 +320,10 @@ notify = { version = "6", optional = true }
 tun = { version = "0.7", features = ["async"], optional = true  }
 netstack-lwip = { git = "https://github.com/eycorsican/netstack-lwip", rev = "4cc3162", optional = true }
 wg-netstack = { path = "../wg-netstack", optional = true }
-netstack-smoltcp = { git = "https://github.com/eycorsican/netstack-smoltcp", branch = "pr-16-initialize-unfilled", optional = true }
+# Registry release, not a git branch. This was pinned to an unmerged PR branch
+# ("pr-16-initialize-unfilled"), which is neither reproducible -- a branch can be
+# force-pushed -- nor a sound thing to ship a security product on.
+netstack-smoltcp = { version = "0.2.4", optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 ipconfig = "0.3"
