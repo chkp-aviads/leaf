@@ -4,14 +4,18 @@ set -ex
 
 name=leaf
 package=leaf-ffi
-manifest=android/Cargo.toml
 mode=--release
 targets=
+
+# Must match scripts/apple_common.sh, or Android ships a different library from iOS.
+# `picard` selects netstack-smoltcp over lwIP and trims the inbound/outbound set.
+features=picard
 
 if [ ! -z "$2" ]; then
 	targets="$2"
 else
-	targets="aarch64-linux-android armv7-linux-androideabi x86_64-linux-android i686-linux-android"
+	# i686 is emulator-only and no longer a shipping ABI; pass it via $2 if you need it.
+	targets="aarch64-linux-android armv7-linux-androideabi x86_64-linux-android"
 fi
 
 for target in $targets; do
@@ -37,6 +41,14 @@ if [ ! -d "${NDK_HOME}" ]; then
 	echo "NDK_HOME does not exist: ${NDK_HOME}" >&2
 	exit 1
 fi
+
+# The -sys crates build through cmake, and CMAKE_GENERATOR=Ninja is set below.
+for tool in cmake ninja; do
+	if ! command -v $tool >/dev/null 2>&1; then
+		echo "$tool is required but not on PATH (brew install cmake ninja)" >&2
+		exit 1
+	fi
+done
 
 if [ ! -d "${NDK_HOME}/toolchains/llvm/prebuilt/${HOST_OS}-${HOST_ARCH}/bin" ]; then
 	HOST_ARCH=`uname -m | tr "[:upper:]" "[:lower:]"`
@@ -89,7 +101,7 @@ for target in $targets; do
 			echo "Unknown target $target"
 			;;
 	esac
-	cargo build -p $package --target $target $mode
+	cargo build -p $package --target $target $mode --no-default-features --features "$features"
 done
 
 android_libs=$BASE/../target/leaf-android-libs
@@ -98,6 +110,10 @@ mkdir -p $android_libs
 for target in $targets; do
 	mv $BASE/../target/$target/$profile/libleaf.so $android_libs/libleaf-$target.so
 done
+if ! command -v cbindgen >/dev/null 2>&1; then
+	cargo install cbindgen
+fi
+
 cbindgen \
 	--config $BASE/../$package/cbindgen.toml \
 	$BASE/../$package/src/lib.rs > $android_libs/$name.h
