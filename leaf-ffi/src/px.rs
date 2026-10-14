@@ -169,6 +169,10 @@ pub extern "C" fn px_is_running(rt_id: u16) -> bool {
 
 /// Install (or replace) the wg-quick config for `key`.
 ///
+/// Optional socket caps may be appended as a `[Leaf]` section (`MaxTCPSockets`,
+/// `MaxUDPSockets`, `UDPDNSReserve`); see `wg_netstack::stack::SocketLimits`.
+/// Re-calling this with new values rebuilds the tunnel with them.
+///
 /// Validated synchronously, so a bad config is reported here rather than
 /// failing later on a background task. The tunnel itself comes up lazily on
 /// first use, so this allocates nothing beyond the parsed config: when policy

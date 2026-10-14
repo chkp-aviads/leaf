@@ -292,7 +292,7 @@ impl WgSlot {
         // The tunnel's tasks are spawned on whichever runtime we are on.
         let built_on = tokio::runtime::Handle::current().id();
         let (tunnel, device, tasks) = WgTunnel::connect(&cfg).await?;
-        let stack = WgStack::new(device, &tunnel)?;
+        let stack = WgStack::with_limits(device, &tunnel, cfg.limits)?;
         let live = Arc::new(Live {
             tunnel,
             stack,

@@ -26,5 +26,5 @@ pub mod tunnel;
 pub use config::{ConfigError, Key, PeerConfig, WgConfig};
 pub use registry::{Live, SlotError, WgSlot};
 pub use resolve::{HostRecord, ResolveError};
-pub use stack::WgStack;
+pub use stack::{SocketLimits, WgStack};
 pub use tunnel::{TunnelError, TunnelState, TunnelStatus, WgDevice, WgTunnel};

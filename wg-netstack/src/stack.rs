@@ -13,7 +13,7 @@ use std::task::{Context, Poll};
 
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr};
 use tokio_smoltcp::{BufferSize, Net, NetConfig, TcpStream, UdpSocket};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::tunnel::{WgDevice, WgTunnel};
 
@@ -52,18 +52,78 @@ const UDP_TX_BUFFER: usize = 8 * 1024;
 /// This is what makes the memory budget bounded rather than merely typical.
 /// leaf will accept as many SOCKS5 CONNECTs as arrive, and each in-tunnel socket
 /// costs `TCP_RX_BUFFER + TCP_TX_BUFFER`; without a cap a connection burst is an
-/// OOM-kill in an extension with a jetsam budget. Refusing the 65th connection
-/// degrades one request. Being killed drops every request and the tunnel.
+/// OOM-kill in an extension with a jetsam budget (~50 MB on iOS). Refusing the
+/// 65th connection degrades one request. Being killed drops every request and
+/// the tunnel.
 ///
 /// Worst case here: 64 * 128 KiB = 8 MB, reached only at peak concurrency since
 /// buffers are allocated per live socket and released on close.
+///
+/// This is the *default*; see [`SocketLimits`] for the runtime-tunable value.
 ///
 /// ponytail: this is the knob to trade against TCP_*_BUFFER. cap * per-conn is
 /// the number that has to fit the budget.
 pub const MAX_TCP_SOCKETS: usize = 64;
 
-/// UDP sessions are cheaper and shorter-lived, but still bounded.
-pub const MAX_UDP_SOCKETS: usize = 32;
+/// Default cap on concurrent in-tunnel UDP sockets.
+///
+/// UDP is cheap -- `UDP_RX_BUFFER + UDP_TX_BUFFER` = 16 KiB each, so 128 sockets
+/// is 2 MB worst case, a quarter of the TCP budget. The old cap of 32 was too
+/// tight: QUIC (UDP 443) opens one socket per session, and a Safari page load
+/// filled it, after which every new bind -- including in-tunnel DNS -- was
+/// refused until sessions aged out. Four times the headroom, plus the DNS
+/// reserve below, costs 1.5 MB more.
+pub const MAX_UDP_SOCKETS: usize = 128;
+
+/// Default number of UDP slots only DNS may use. General binds are refused once
+/// `max_udp - udp_dns_reserve` are live; DNS may use the full cap. Without it a
+/// burst of QUIC sessions starves name resolution, which then fails every new
+/// TCP connect too (nothing can be resolved), turning a UDP overload into a
+/// total outage.
+pub const DEFAULT_UDP_DNS_RESERVE: usize = 8;
+
+/// Bounds applied to runtime-supplied limits, so a bad remote value cannot
+/// either disable the stack (too small) or reintroduce the OOM the cap exists
+/// to prevent (too large). Upper TCP bound: 512 * 128 KiB = 64 MB, i.e. above
+/// the extension budget on its own; it is the tuner's job to stay well below.
+pub const TCP_LIMIT_RANGE: std::ops::RangeInclusive<usize> = 8..=512;
+pub const UDP_LIMIT_RANGE: std::ops::RangeInclusive<usize> = 8..=1024;
+
+/// Effective in-tunnel socket caps for one stack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SocketLimits {
+    pub max_tcp: usize,
+    pub max_udp: usize,
+    pub udp_dns_reserve: usize,
+}
+
+impl Default for SocketLimits {
+    fn default() -> Self {
+        Self {
+            max_tcp: MAX_TCP_SOCKETS,
+            max_udp: MAX_UDP_SOCKETS,
+            udp_dns_reserve: DEFAULT_UDP_DNS_RESERVE,
+        }
+    }
+}
+
+impl SocketLimits {
+    /// Clamp raw values into range: TCP 8..=512, UDP 8..=1024, reserve
+    /// 0..=max_udp/2 (so general UDP always keeps at least half the cap).
+    pub fn clamped(max_tcp: usize, max_udp: usize, udp_dns_reserve: usize) -> Self {
+        let max_udp = max_udp.clamp(*UDP_LIMIT_RANGE.start(), *UDP_LIMIT_RANGE.end());
+        Self {
+            max_tcp: max_tcp.clamp(*TCP_LIMIT_RANGE.start(), *TCP_LIMIT_RANGE.end()),
+            max_udp,
+            udp_dns_reserve: udp_dns_reserve.min(max_udp / 2),
+        }
+    }
+
+    /// Cap for general (non-DNS) UDP binds.
+    fn general_udp(&self) -> usize {
+        self.max_udp - self.udp_dns_reserve
+    }
+}
 
 /// Fixed seed material is fine: smoltcp uses `random_seed` to pick initial TCP
 /// sequence numbers, and the tunnel already provides confidentiality and
@@ -178,6 +238,7 @@ pub struct WgStack {
     net: Net,
     /// The source address the stack dials from. See `primary_address`.
     primary: IpAddr,
+    limits: SocketLimits,
     live_tcp: Arc<AtomicUsize>,
     live_udp: Arc<AtomicUsize>,
 }
@@ -215,6 +276,15 @@ impl WgStack {
     /// Must be called inside a tokio runtime: `Net::new` spawns the stack's
     /// reactor task. Dropping the `WgStack` stops that reactor.
     pub fn new(device: WgDevice, tunnel: &WgTunnel) -> io::Result<Self> {
+        Self::with_limits(device, tunnel, SocketLimits::default())
+    }
+
+    /// As [`WgStack::new`], with explicit socket caps.
+    pub fn with_limits(
+        device: WgDevice,
+        tunnel: &WgTunnel,
+        limits: SocketLimits,
+    ) -> io::Result<Self> {
         let addresses = tunnel.addresses();
         let primary = primary_address(addresses).ok_or_else(|| {
             io::Error::new(
@@ -258,9 +328,16 @@ impl WgStack {
 
         let net = Net::new(device, config);
         debug!(source = %primary, mtu = tunnel.mtu(), "in-tunnel stack up");
+        info!(
+            max_tcp = limits.max_tcp,
+            max_udp = limits.max_udp,
+            udp_dns_reserve = limits.udp_dns_reserve,
+            "in-tunnel socket limits"
+        );
         Ok(Self {
             net,
             primary,
+            limits,
             live_tcp: Arc::new(AtomicUsize::new(0)),
             live_udp: Arc::new(AtomicUsize::new(0)),
         })
@@ -295,19 +372,22 @@ impl WgStack {
 
     /// Open a TCP connection to `dst` from inside the tunnel.
     ///
-    /// Fails with `ConnectionRefused` once `MAX_TCP_SOCKETS` are live, which
+    /// Fails with `ConnectionRefused` once `max_tcp` sockets are live, which
     /// leaf turns into a failed session -- one degraded request instead of an
     /// out-of-memory kill that takes the whole tunnel down.
     pub async fn connect_tcp(&self, dst: SocketAddr) -> io::Result<WgTcpStream> {
         self.check_family(dst.ip())?;
-        let slot = SocketSlot::claim(&self.live_tcp, MAX_TCP_SOCKETS).ok_or_else(|| {
+        let slot = SocketSlot::claim(&self.live_tcp, self.limits.max_tcp).ok_or_else(|| {
             warn!(
-                limit = MAX_TCP_SOCKETS,
+                limit = self.limits.max_tcp,
                 "refusing in-tunnel TCP connect: socket cap reached"
             );
             io::Error::new(
                 io::ErrorKind::ConnectionRefused,
-                format!("in-tunnel socket cap reached ({MAX_TCP_SOCKETS} live)"),
+                format!(
+                    "in-tunnel socket cap reached ({} live)",
+                    self.limits.max_tcp
+                ),
             )
         })?;
         let inner = self.net.tcp_connect(dst).await?;
@@ -315,15 +395,25 @@ impl WgStack {
     }
 
     /// Bind a UDP socket inside the tunnel on an ephemeral port.
+    ///
+    /// Refused once `max_udp - udp_dns_reserve` are live; the remainder is kept
+    /// for [`WgStack::bind_udp_dns`].
     pub async fn bind_udp(&self) -> io::Result<WgUdpSocket> {
-        let slot = SocketSlot::claim(&self.live_udp, MAX_UDP_SOCKETS).ok_or_else(|| {
-            warn!(
-                limit = MAX_UDP_SOCKETS,
-                "refusing in-tunnel UDP bind: socket cap reached"
-            );
+        self.bind_udp_within(self.limits.general_udp()).await
+    }
+
+    /// As [`WgStack::bind_udp`], for in-tunnel DNS: may use the full UDP cap,
+    /// including the slots reserved so QUIC cannot starve name resolution.
+    pub async fn bind_udp_dns(&self) -> io::Result<WgUdpSocket> {
+        self.bind_udp_within(self.limits.max_udp).await
+    }
+
+    async fn bind_udp_within(&self, limit: usize) -> io::Result<WgUdpSocket> {
+        let slot = SocketSlot::claim(&self.live_udp, limit).ok_or_else(|| {
+            warn!(limit, "refusing in-tunnel UDP bind: socket cap reached");
             io::Error::new(
                 io::ErrorKind::ConnectionRefused,
-                format!("in-tunnel UDP socket cap reached ({MAX_UDP_SOCKETS} live)"),
+                format!("in-tunnel UDP socket cap reached ({limit} live)"),
             )
         })?;
         let unspecified = if self.primary.is_ipv4() {
@@ -333,5 +423,91 @@ impl WgStack {
         };
         let inner = self.net.udp_bind(unspecified).await?;
         Ok(WgUdpSocket { inner, _slot: slot })
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    fn counter() -> Arc<AtomicUsize> {
+        Arc::new(AtomicUsize::new(0))
+    }
+
+    #[test]
+    fn defaults_are_128_udp_with_8_reserved() {
+        let l = SocketLimits::default();
+        assert_eq!((l.max_tcp, l.max_udp, l.udp_dns_reserve), (64, 128, 8));
+        assert_eq!(l.general_udp(), 120);
+    }
+
+    #[test]
+    fn clamping_bounds_every_field() {
+        assert_eq!(
+            SocketLimits::clamped(0, 0, 999),
+            SocketLimits {
+                max_tcp: 8,
+                max_udp: 8,
+                udp_dns_reserve: 4
+            }
+        );
+        assert_eq!(
+            SocketLimits::clamped(100_000, 100_000, 100_000),
+            SocketLimits {
+                max_tcp: 512,
+                max_udp: 1024,
+                udp_dns_reserve: 512
+            }
+        );
+        assert_eq!(SocketLimits::clamped(64, 128, 0).udp_dns_reserve, 0);
+    }
+
+    /// General binds stop at cap - reserve; DNS keeps going to the full cap.
+    #[test]
+    fn general_udp_is_refused_at_cap_minus_reserve_but_dns_is_not() {
+        let limits = SocketLimits::clamped(64, 16, 4);
+        let live = counter();
+        let mut held = Vec::new();
+        for _ in 0..limits.general_udp() {
+            held.push(SocketSlot::claim(&live, limits.general_udp()).expect("general under limit"));
+        }
+        assert!(SocketSlot::claim(&live, limits.general_udp()).is_none());
+        for _ in 0..limits.udp_dns_reserve {
+            held.push(SocketSlot::claim(&live, limits.max_udp).expect("dns uses reserve"));
+        }
+        assert!(
+            SocketSlot::claim(&live, limits.max_udp).is_none(),
+            "full cap is hard"
+        );
+        assert_eq!(live.load(Ordering::Relaxed), limits.max_udp);
+    }
+
+    #[test]
+    fn slots_are_released_on_drop() {
+        let live = counter();
+        let a = SocketSlot::claim(&live, 1).unwrap();
+        assert!(SocketSlot::claim(&live, 1).is_none());
+        drop(a);
+        assert_eq!(live.load(Ordering::Relaxed), 0);
+        assert!(SocketSlot::claim(&live, 1).is_some());
+    }
+
+    /// Racing claimers never exceed the limit.
+    #[test]
+    fn concurrent_claims_never_exceed_the_limit() {
+        let live = counter();
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let live = Arc::clone(&live);
+                std::thread::spawn(move || {
+                    (0..100)
+                        .filter_map(|_| SocketSlot::claim(&live, 50))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let held: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert_eq!(held.iter().map(Vec::len).sum::<usize>(), 50);
     }
 }

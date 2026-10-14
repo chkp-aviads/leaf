@@ -108,7 +108,8 @@ pub async fn resolve(
         .map_err(|e| ResolveError::BadName(host.to_owned(), e.to_string()))?;
 
     // One in-tunnel socket for the whole resolution, reused across servers.
-    let socket = stack.bind_udp().await?;
+    // DNS may use the slots reserved from general UDP (QUIC).
+    let socket = stack.bind_udp_dns().await?;
     let mut buf = vec![0u8; 1232]; // EDNS-free UDP answers fit well inside this.
 
     for server in servers {

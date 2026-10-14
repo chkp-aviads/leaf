@@ -13,6 +13,8 @@ use std::net::IpAddr;
 
 use base64::Engine as _;
 
+use crate::stack::SocketLimits;
+
 /// Same default as wireproxy (`config.go:487`).
 pub const DEFAULT_MTU: u16 = 1420;
 
@@ -89,6 +91,8 @@ pub struct WgConfig {
     pub mtu: u16,
     pub listen_port: Option<u16>,
     pub peers: Vec<PeerConfig>,
+    /// In-tunnel socket caps, from the optional `[Leaf]` section.
+    pub limits: SocketLimits,
 }
 
 /// One `key = value` pair, tagged with the section it appeared under.
@@ -100,6 +104,9 @@ struct Entry {
 enum Section {
     Interface(Vec<Entry>),
     Peer(Vec<Entry>),
+    /// `[Leaf]`: leaf-specific tuning, not part of wg-quick. Older builds ignore it
+    /// as an unknown section, so it is safe to send to any version.
+    Leaf(Vec<Entry>),
     /// `[Socks5]`, `[http]`, `[TCPClientTunnel]`, ... — parsed and ignored.
     /// Picard's converter may still emit them, and wireproxy tolerated them.
     Other,
@@ -207,7 +214,16 @@ impl WgConfig {
             return Err(ConfigError::NoPeers);
         }
 
+        let limits = sections
+            .iter()
+            .find_map(|s| match s {
+                Section::Leaf(e) => Some(parse_limits(e)),
+                _ => None,
+            })
+            .unwrap_or_default();
+
         Ok(WgConfig {
+            limits,
             private_key,
             addresses,
             dns,
@@ -216,6 +232,27 @@ impl WgConfig {
             peers,
         })
     }
+}
+
+/// Reads `MaxTCPSockets`, `MaxUDPSockets`, `UDPDNSReserve` from `[Leaf]`.
+///
+/// Lenient by design: these tune capacity and may arrive from remote config, so
+/// a missing or unparseable value falls back to the default (with a warning)
+/// rather than refusing to bring the tunnel up. Parsed values are clamped.
+fn parse_limits(entries: &[Entry]) -> SocketLimits {
+    let default = SocketLimits::default();
+    let read = |key: &str, name: &str, fallback: usize| match lookup(entries, key) {
+        None => fallback,
+        Some(v) => v.parse::<usize>().unwrap_or_else(|_| {
+            tracing::warn!("[Leaf] {name} is not a non-negative integer; using {fallback}");
+            fallback
+        }),
+    };
+    SocketLimits::clamped(
+        read("maxtcpsockets", "MaxTCPSockets", default.max_tcp),
+        read("maxudpsockets", "MaxUDPSockets", default.max_udp),
+        read("udpdnsreserve", "UDPDNSReserve", default.udp_dns_reserve),
+    )
 }
 
 fn split_sections(text: &str) -> Result<Vec<Section>, ConfigError> {
@@ -229,6 +266,7 @@ fn split_sections(text: &str) -> Result<Vec<Section>, ConfigError> {
             out.push(match name.trim().to_ascii_lowercase().as_str() {
                 "interface" => Section::Interface(Vec::new()),
                 "peer" => Section::Peer(Vec::new()),
+                "leaf" => Section::Leaf(Vec::new()),
                 _ => Section::Other,
             });
             continue;
@@ -253,7 +291,9 @@ fn split_sections(text: &str) -> Result<Vec<Section>, ConfigError> {
             value: value.to_owned(),
         };
         match out.last_mut() {
-            Some(Section::Interface(e)) | Some(Section::Peer(e)) => e.push(entry),
+            Some(Section::Interface(e)) | Some(Section::Peer(e)) | Some(Section::Leaf(e)) => {
+                e.push(entry)
+            }
             Some(Section::Other) => {}
             None => {
                 return Err(ConfigError::OrphanKey {
@@ -744,5 +784,46 @@ PublicKey = e8LKAc+f9xEzq9Ar7+MfKRrs+gZ/4yzvpRJLRJ/VJ1w=
                 }
             }
         }
+    }
+
+    // ---- [Leaf] socket limits ----------------------------------------------
+
+    const MIN_CONF: &str =
+        "[Interface]\nPrivateKey = LAr1aNSNF9d0MjwUgAVC4020T0N/E5NUtqVv5EnsSz0=\n\
+        [Peer]\nPublicKey = e8LKAc+f9xEzq9Ar7+MfKRrs+gZ/4yzvpRJLRJ/VJ1w=\nEndpoint = 127.0.0.1:1\n";
+
+    #[test]
+    fn leaf_section_absent_means_defaults() {
+        assert_eq!(
+            WgConfig::parse(MIN_CONF).unwrap().limits,
+            SocketLimits::default()
+        );
+    }
+
+    #[test]
+    fn leaf_section_overrides_and_is_case_insensitive() {
+        let text = format!(
+            "{MIN_CONF}[Leaf]\nmaxtcpsockets = 100\nMaxUDPSockets=200\nUDPDNSReserve = 16\n"
+        );
+        let l = WgConfig::parse(&text).unwrap().limits;
+        assert_eq!((l.max_tcp, l.max_udp, l.udp_dns_reserve), (100, 200, 16));
+    }
+
+    #[test]
+    fn leaf_section_is_clamped_and_partial_keeps_defaults() {
+        let text = format!("{MIN_CONF}[Leaf]\nMaxTCPSockets = 1\nUDPDNSReserve = 5000\n");
+        let l = WgConfig::parse(&text).unwrap().limits;
+        assert_eq!(l.max_tcp, 8);
+        assert_eq!(l.max_udp, 128);
+        assert_eq!(l.udp_dns_reserve, 64, "reserve is at most half the UDP cap");
+    }
+
+    #[test]
+    fn leaf_section_garbage_falls_back_instead_of_failing() {
+        let text = format!("{MIN_CONF}[Leaf]\nMaxTCPSockets = lots\nMaxUDPSockets = -3\n");
+        assert_eq!(
+            WgConfig::parse(&text).unwrap().limits,
+            SocketLimits::default()
+        );
     }
 }
