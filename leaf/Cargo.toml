@@ -318,7 +318,7 @@ notify = { version = "6", optional = true }
 
 # TUN
 tun = { version = "0.7", features = ["async"], optional = true  }
-netstack-lwip = { git = "https://github.com/eycorsican/netstack-lwip", rev = "4cc3162", optional = true }
+netstack-lwip = { git = "https://github.com/eycorsican/netstack-lwip", rev = "4943435", optional = true }
 wg-netstack = { path = "../wg-netstack", optional = true }
 # Registry release, not a git branch. This was pinned to an unmerged PR branch
 # ("pr-16-initialize-unfilled"), which is neither reproducible -- a branch can be
