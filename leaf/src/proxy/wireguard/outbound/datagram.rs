@@ -14,6 +14,11 @@ use super::stream::{resolve_destination, Handler as StreamHandler};
 
 pub struct Handler {
     pub control_key: String,
+    /// Keeps leaf's runtime attached to the tunnel slot for as long as this
+    /// outbound exists, and detaches it when leaf drops the outbound (instance
+    /// exit or failed start). Held here rather than on the stream handler only
+    /// because that one is also built ad hoc, below.
+    pub _runtime: wg_netstack::registry::RuntimeAttachment,
 }
 
 #[async_trait]

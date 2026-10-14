@@ -338,6 +338,17 @@ pub type DnsCallback = extern "C" fn(json: *const c_char, user_data: *mut c_void
 
 static NEXT_REQUEST_ID: AtomicI32 = AtomicI32::new(1);
 
+/// A fresh request id, always > 0. Wrapping into 0 or negative would break the
+/// contract the caller relies on to decide who releases `user_data`: a
+/// non-positive return means "the callback will never fire".
+fn next_request_id() -> i32 {
+    NEXT_REQUEST_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| {
+            Some(if id == i32::MAX { 1 } else { id + 1 })
+        })
+        .unwrap_or_else(|id| id)
+}
+
 /// Carries the caller's opaque `user_data` across a task boundary.
 ///
 /// Declared at module scope with an accessor on purpose: with edition 2021's
@@ -356,17 +367,109 @@ impl UserData {
     }
 }
 
-fn request_table() -> &'static parking_lot::Mutex<
-    std::collections::HashMap<i32, tokio::task::AbortHandle>,
-> {
+/// One resolve, from `px_wg_resolve` until its callback fires.
+///
+/// The callback fires **exactly once**, whatever happens: with the answer, or
+/// NULL on failure, on cancel, or when the request is dropped without running
+/// (`px_wg_clear` before leaf attached a runtime, or a runtime that shut down
+/// under it). The caller retains `user_data` for the callback to release, so a
+/// callback that never fires is a leak and a caller left waiting on a timeout.
+struct DnsRequest {
+    id: i32,
+    reply: parking_lot::Mutex<Option<(DnsCallback, UserData)>>,
+    task: parking_lot::Mutex<Option<tokio::task::AbortHandle>>,
+}
+
+impl DnsRequest {
+    /// Fire the callback, unless it already fired. Returns whether this call fired it.
+    fn reply(&self, json: Option<CString>) -> bool {
+        // Taken under the lock, called outside it: the callback is foreign code.
+        let Some((cb, user_data)) = self.reply.lock().take() else {
+            return false;
+        };
+        match json {
+            Some(s) => cb(s.as_ptr(), user_data.raw()),
+            // NULL on any failure, matching the Go behaviour Picard's
+            // VPNDNSResolver already treats as "fall through to the next
+            // resolver in the chain".
+            None => cb(std::ptr::null(), user_data.raw()),
+        }
+        true
+    }
+
+    /// A request still queued for a runtime is left in the queue: it sees the
+    /// reply is gone and does nothing when it runs, and `attach` or `clear`
+    /// frees it either way.
+    fn cancel(&self) -> bool {
+        let replied = self.reply(None);
+        if let Some(task) = self.task.lock().take() {
+            task.abort();
+        }
+        replied
+    }
+}
+
+impl Drop for DnsRequest {
+    fn drop(&mut self) {
+        request_table().lock().remove(&self.id);
+        self.reply(None);
+    }
+}
+
+/// Weak, so the table never keeps a request alive: the last strong reference
+/// is the work itself, and dropping it is what fires a NULL callback.
+fn request_table(
+) -> &'static parking_lot::Mutex<std::collections::HashMap<i32, std::sync::Weak<DnsRequest>>> {
     static TABLE: std::sync::OnceLock<
-        parking_lot::Mutex<std::collections::HashMap<i32, tokio::task::AbortHandle>>,
+        parking_lot::Mutex<std::collections::HashMap<i32, std::sync::Weak<DnsRequest>>>,
     > = std::sync::OnceLock::new();
     TABLE.get_or_init(Default::default)
 }
 
+async fn resolve_json(
+    slot: &wg_netstack::registry::WgSlot,
+    host: &str,
+    ipv4: bool,
+) -> Option<CString> {
+    let live = match slot.live().await {
+        Ok(live) => live,
+        Err(e) => {
+            tracing::debug!("in-tunnel DNS for {host} has no tunnel: {e}");
+            return None;
+        }
+    };
+    let servers = live.tunnel.dns_servers().to_vec();
+    match wg_netstack::resolve::resolve(&live.stack, &servers, host, ipv4).await {
+        Ok(records) => match CString::new(wg_netstack::resolve::records_to_json(&records)) {
+            Ok(json) => Some(json),
+            Err(e) => {
+                tracing::error!("in-tunnel DNS for {host} produced invalid C JSON: {e}");
+                None
+            }
+        },
+        Err(e) => {
+            tracing::debug!("in-tunnel DNS for {host} failed: {e}");
+            None
+        }
+    }
+}
+
 /// Resolve `host` inside the tunnel. Returns a request id (>0), or a negative
-/// error. The result arrives on `cb`, on a tokio worker thread.
+/// error. A negative return never invokes the callback; a positive one invokes
+/// it exactly once, with JSON or NULL. Where it runs:
+///
+/// * normally on leaf's runtime thread, when the lookup finishes;
+/// * synchronously, on the calling thread, from `px_wg_resolve` itself when the
+///   attached runtime has already shut down or the slot is cleared
+///   concurrently, from `px_wg_resolve_cancel`, or from `px_wg_clear`;
+/// * on leaf's thread during `px_shutdown`, as the runtime drops unfinished
+///   lookups. That is inside a tokio context, so the callback must not block,
+///   call `px_shutdown`, or call anything that blocks on a runtime.
+///
+/// Brings the tunnel up if it is not up yet: Picard asking for in-tunnel DNS is
+/// the policy decision to use the tunnel, exactly as a proxied connection is.
+/// A request made after `px_wg_set_config` but before the leaf instance has
+/// started waits for it, rather than failing or leaking outside the tunnel.
 ///
 /// `ipv4` selects A vs AAAA; there is no "both" mode, matching the Go
 /// `wgResolveDNS` contract that `resolveDNSRecords(host:ipv4:)` is built on.
@@ -374,7 +477,7 @@ fn request_table() -> &'static parking_lot::Mutex<
 /// # Safety
 /// `key` and `host` must be NUL-terminated UTF-8 strings. `cb` must be a valid
 /// function pointer. `user_data` is passed back untouched and must remain valid
-/// until the callback fires (or the request is cancelled).
+/// until the callback fires.
 #[no_mangle]
 pub unsafe extern "C" fn px_wg_resolve(
     key: *const c_char,
@@ -389,63 +492,54 @@ pub unsafe extern "C" fn px_wg_resolve(
     let Some(slot) = wg_netstack::registry::existing(key) else {
         return PX_ERR_NOT_CONFIGURED;
     };
-    // A resolve needs a live tunnel to send the query through. Bringing one up
-    // here would make a DNS lookup silently start a VPN tunnel, which is a
-    // policy decision that belongs to Picard, not to us.
-    let Some(handle) = slot.runtime() else {
-        return PX_ERR_NOT_RUNNING;
-    };
+    if !slot.is_configured() {
+        return PX_ERR_NOT_CONFIGURED;
+    }
 
-    let id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+    let id = next_request_id();
     let host = host.to_owned();
+    let request = std::sync::Arc::new(DnsRequest {
+        id,
+        reply: parking_lot::Mutex::new(Some((cb, UserData(user_data)))),
+        task: parking_lot::Mutex::new(None),
+    });
+    // Registered before any work can run, so the work's completion (which
+    // drops the request and unregisters it) can never precede registration.
+    request_table()
+        .lock()
+        .insert(id, std::sync::Arc::downgrade(&request));
 
-    let user_data = UserData(user_data);
-
-    let task = handle.spawn(async move {
-        let json = match slot.live().await {
-            Ok(live) => {
-                let servers = live.tunnel.dns_servers().to_vec();
-                match wg_netstack::resolve::resolve(&live.stack, &servers, &host, ipv4).await {
-                    Ok(records) => Some(wg_netstack::resolve::records_to_json(&records)),
-                    Err(e) => {
-                        tracing::debug!("in-tunnel DNS for {host} failed: {e}");
-                        None
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::debug!("in-tunnel DNS for {host} has no tunnel: {e}");
-                None
-            }
-        };
-
-        request_table().lock().remove(&id);
-
-        match json.and_then(|j| CString::new(j).ok()) {
-            Some(s) => cb(s.as_ptr(), user_data.raw()),
-            // NULL on any failure, matching the Go behaviour Picard's
-            // VPNDNSResolver already treats as "fall through to the next
-            // resolver in the chain".
-            None => cb(std::ptr::null(), user_data.raw()),
+    let queued_request = std::sync::Arc::clone(&request);
+    let task_slot = std::sync::Arc::clone(&slot);
+    slot.on_runtime(move |handle| {
+        // Cancelled while queued.
+        if queued_request.reply.lock().is_none() {
+            return;
+        }
+        let task_request = std::sync::Arc::clone(&queued_request);
+        let task = handle.spawn(async move {
+            let json = resolve_json(&task_slot, &host, ipv4).await;
+            task_request.reply(json);
+        });
+        *queued_request.task.lock() = Some(task.abort_handle());
+        // Cancelled before the task existed: the reply already went, so just
+        // stop the work.
+        if queued_request.reply.lock().is_none() {
+            task.abort();
         }
     });
-
-    request_table().lock().insert(id, task.abort_handle());
     id
 }
 
-/// Cancel an in-flight resolve. Returns true if a live request was cancelled.
-///
-/// Racy by nature: the callback may already be running when this is called, so
-/// a `true` return does not guarantee the callback will not fire. The Go build
-/// had the same property.
+/// Cancel an in-flight resolve. Returns true if this call completed the request,
+/// in which case the callback has already fired with NULL, on this thread.
+/// False means the request had already finished: its callback has fired or is
+/// firing. Either way the callback fires exactly once.
 #[no_mangle]
 pub extern "C" fn px_wg_resolve_cancel(request_id: c_int) -> bool {
-    match request_table().lock().remove(&request_id) {
-        Some(handle) => {
-            handle.abort();
-            true
-        }
+    let request = request_table().lock().remove(&request_id);
+    match request.and_then(|weak| weak.upgrade()) {
+        Some(request) => request.cancel(),
         None => false,
     }
 }

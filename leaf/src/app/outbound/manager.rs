@@ -397,12 +397,24 @@ impl OutboundManager {
                     } else {
                         settings.control_key.clone()
                     };
+                    // Hand the slot our runtime now, at startup, rather than on
+                    // the first proxied connection: the C API (in-tunnel DNS in
+                    // particular) has no runtime of its own and is used before
+                    // any traffic is routed here. `start` builds outbounds
+                    // inside `rt.enter()`, and `reload` runs on the runtime.
+                    // The handler holds the attachment, so it ends with us.
+                    let handle = tokio::runtime::Handle::try_current()
+                        .map_err(|e| anyhow!("wireguard outbound [{tag}] requires a runtime: {e}"))?;
+                    let runtime = wg_netstack::registry::slot(&control_key).attach_runtime(handle);
                     // Both halves: unlike quic, this outbound must carry UDP as
                     // well, because Picard uses SOCKS5 UDP ASSOCIATE over it.
                     let stream = Arc::new(wireguard::outbound::StreamHandler {
                         control_key: control_key.clone(),
                     });
-                    let datagram = Arc::new(wireguard::outbound::DatagramHandler { control_key });
+                    let datagram = Arc::new(wireguard::outbound::DatagramHandler {
+                        control_key,
+                        _runtime: runtime,
+                    });
                     HandlerBuilder::default()
                         .tag(tag.clone())
                         .stream_handler(stream)

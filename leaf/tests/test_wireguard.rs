@@ -434,3 +434,74 @@ fn socks5_udp_associate_through_wireguard() {
         "UDP payload should round-trip through the tunnel"
     );
 }
+
+/// In-tunnel DNS before any traffic (the SASE split-tunnel case): leaf must
+/// hand the slot its runtime at startup, so the C API can resolve -- bringing
+/// the tunnel up -- without a proxied connection having done it first. And once
+/// the owner shuts leaf down and clears the slot, that runtime is forgotten.
+#[test]
+fn leaf_attaches_its_runtime_at_startup_for_in_tunnel_dns() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let config = r#"
+    {
+        "inbounds": [
+            { "protocol": "socks", "address": "127.0.0.1", "port": 21806 }
+        ],
+        "outbounds": [
+            { "tag": "wg", "protocol": "wireguard",
+              "settings": { "controlKey": "leaf-test-dns-first" } }
+        ]
+    }
+    "#;
+    let slot = wg_netstack::registry::slot("leaf-test-dns-first");
+    for _ in 0..2 {
+        let (peer, leaf) = setup(&rt, "leaf-test-dns-first", config.to_string());
+        rt.block_on(peer.spawn_dns("first.internal", std::net::Ipv4Addr::new(10, 9, 0, 55), 30));
+
+        assert!(
+            slot.runtime().is_some(),
+            "leaf must attach its runtime at startup"
+        );
+        assert!(
+            slot.current().is_none(),
+            "attaching must not bring the tunnel up"
+        );
+
+        // What px_wg_resolve does, on leaf's runtime rather than the test's.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let task_slot = std::sync::Arc::clone(&slot);
+        slot.on_runtime(move |handle| {
+            handle.spawn(async move {
+                let live = task_slot
+                    .live()
+                    .await
+                    .expect("the resolve brings the tunnel up");
+                let servers = live.tunnel.dns_servers().to_vec();
+                let records =
+                    wg_netstack::resolve::resolve(&live.stack, &servers, "first.internal", true)
+                        .await;
+                let _ = tx.send(records.map(|r| r.first().map(|r| r.ip)));
+            });
+        });
+        let ip = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the resolve should complete")
+            .expect("in-tunnel DNS should succeed");
+        assert_eq!(ip, Some("10.9.0.55".parse().unwrap()));
+
+        // Leaf exiting detaches its runtime on its own, before (or without)
+        // the owner's clear: the outbound holding the attachment goes with it.
+        drop(leaf);
+        for _ in 0..500 {
+            if slot.runtime().is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            slot.runtime().is_none(),
+            "an exited instance must not leave its runtime attached"
+        );
+        slot.clear();
+    }
+}

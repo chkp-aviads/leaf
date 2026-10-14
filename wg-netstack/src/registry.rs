@@ -10,7 +10,18 @@
 //! the cost is a config struct and nothing else: no socket, no handshake, no
 //! smoltcp buffers. That is the whole point of the exercise, and it also means
 //! `set_config` needs no tokio runtime — the connect happens on leaf's runtime,
-//! inside the outbound handler that asked for it.
+//! inside whichever caller asked for it.
+//!
+//! "First use" includes in-tunnel DNS from the C API, not just a proxied
+//! connection. The C API has no runtime of its own, so leaf attaches its
+//! runtime to the slot when it builds the `wireguard` outbound — at startup,
+//! before any traffic. Work that arrives before that is queued, not refused.
+//!
+//! A tunnel belongs to the runtime that built it: its tasks die with that
+//! runtime. So attaching a runtime invalidates any tunnel built on another one,
+//! and a tunnel built on a runtime other than the attached one is never
+//! published. Without that, a leaf restart (`px_shutdown` returns before the old
+//! runtime has exited) could publish a tunnel whose tasks are about to die.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -24,6 +35,35 @@ use tracing::{debug, info, warn};
 use crate::config::WgConfig;
 use crate::stack::WgStack;
 use crate::tunnel::{TunnelError, TunnelState, TunnelStatus, WgTunnel};
+
+/// Work waiting for a runtime; see [`WgSlot::on_runtime`].
+type RuntimeJob = Box<dyn FnOnce(tokio::runtime::Handle) + Send>;
+
+#[derive(Default)]
+struct RuntimeState {
+    handle: Option<tokio::runtime::Handle>,
+    /// Identifies the current attachment, so a stale [`RuntimeAttachment`]
+    /// cannot detach a newer one. 0 means none.
+    attachment: u64,
+    next_attachment: u64,
+    pending: Vec<RuntimeJob>,
+}
+
+/// Returned by [`WgSlot::attach_runtime`]. Dropping it detaches the runtime,
+/// unless a newer attachment or a `clear` has replaced it since. Leaf keeps it
+/// in the `wireguard` outbound handler, so an instance that fails to start, or
+/// exits, does not leave its dead runtime behind for the C API to spawn onto.
+#[must_use = "dropping the attachment detaches the runtime immediately"]
+pub struct RuntimeAttachment {
+    slot: Arc<WgSlot>,
+    id: u64,
+}
+
+impl Drop for RuntimeAttachment {
+    fn drop(&mut self) {
+        self.slot.detach_runtime(self.id);
+    }
+}
 
 /// A live tunnel and its stack. Dropping this aborts the tunnel's tasks and
 /// stops the smoltcp reactor, releasing every buffer.
@@ -57,15 +97,19 @@ pub struct WgSlot {
     generation: AtomicU64,
     /// The generation the current `Live` was built from.
     live_generation: AtomicU64,
-    /// Captured when a tunnel goes live, so the C API can drive async work
-    /// (DNS, teardown) from a thread that has no runtime of its own.
-    runtime: SyncMutex<Option<tokio::runtime::Handle>>,
+    /// The runtime that owns this tunnel, so the C API can drive async work
+    /// (DNS, wake) from a thread that has no runtime of its own. Attached by
+    /// leaf at startup; detached by `clear` or when leaf's instance goes away,
+    /// so nothing is spawned onto the runtime of an instance that has shut down.
+    runtime: SyncMutex<RuntimeState>,
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum SlotError {
     #[error("no wireguard config has been set for key {0:?}")]
     NotConfigured(String),
+    #[error("wireguard config or lifecycle changed while connecting key {0:?}")]
+    Superseded(String),
     #[error(transparent)]
     Tunnel(#[from] TunnelError),
     #[error("io: {0}")]
@@ -81,7 +125,7 @@ impl WgSlot {
             connecting: AsyncMutex::new(()),
             generation: AtomicU64::new(0),
             live_generation: AtomicU64::new(u64::MAX),
-            runtime: SyncMutex::new(None),
+            runtime: SyncMutex::new(RuntimeState::default()),
         }
     }
 
@@ -93,8 +137,11 @@ impl WgSlot {
     /// reported to the caller immediately rather than failing later on a
     /// background task. Any live tunnel is dropped; the next use reconnects.
     pub fn set_config(&self, cfg: WgConfig) {
-        *self.config.lock() = Some(Arc::new(cfg));
-        let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let generation = {
+            let mut config = self.config.lock();
+            *config = Some(Arc::new(cfg));
+            self.generation.fetch_add(1, Ordering::SeqCst) + 1
+        };
         info!(key = %self.key, generation, "wireguard config installed");
     }
 
@@ -105,21 +152,107 @@ impl WgSlot {
     /// Tear the tunnel down but keep the config, so a later use reconnects.
     /// Synchronous: dropping `Live` aborts its tasks and releases every buffer.
     pub fn stop(&self) {
-        if self.live.write().take().is_some() {
+        let live = {
+            let _config = self.config.lock();
+            self.generation.fetch_add(1, Ordering::SeqCst);
+            self.live.write().take()
+        };
+        if live.is_some() {
             info!(key = %self.key, "wireguard tunnel stopped");
         }
     }
 
-    /// Forget the config too.
+    /// Forget the config too, and detach the runtime: `clear` is how the owner
+    /// says this tunnel's leaf instance is going away. Queued work is dropped,
+    /// which is how its owners learn it will never run.
     pub fn clear(&self) {
-        self.stop();
-        *self.config.lock() = None;
+        let (pending, live) = {
+            let mut runtime = self.runtime.lock();
+            let mut config = self.config.lock();
+            *config = None;
+            self.generation.fetch_add(1, Ordering::SeqCst);
+            let live = self.live.write().take();
+            runtime.handle = None;
+            runtime.attachment = 0;
+            (std::mem::take(&mut runtime.pending), live)
+        };
+        drop(live);
+        // Dropped outside the lock: a job's drop may call back into its owner.
+        drop(pending);
     }
 
-    /// A runtime handle captured when the tunnel came up, for callers that have
-    /// no runtime of their own (the C API).
+    /// The attached runtime, for callers that have none of their own (the C API).
     pub fn runtime(&self) -> Option<tokio::runtime::Handle> {
-        self.runtime.lock().clone()
+        self.runtime.lock().handle.clone()
+    }
+
+    /// Attach the runtime that owns this tunnel, and run any work that was
+    /// waiting for one. Called by leaf when it builds the `wireguard` outbound;
+    /// keep the returned attachment for as long as that runtime runs.
+    ///
+    /// Any tunnel built on a previous runtime is dropped: its tasks live on that
+    /// runtime, so once a new owner takes over it is, or soon will be, dead.
+    pub fn attach_runtime(self: &Arc<Self>, handle: tokio::runtime::Handle) -> RuntimeAttachment {
+        let (id, pending, live) = {
+            let mut runtime = self.runtime.lock();
+            let _config = self.config.lock();
+            runtime.next_attachment += 1;
+            runtime.attachment = runtime.next_attachment;
+            runtime.handle = Some(handle.clone());
+            self.generation.fetch_add(1, Ordering::SeqCst);
+            let live = self.live.write().take();
+            (runtime.attachment, std::mem::take(&mut runtime.pending), live)
+        };
+        drop(live);
+        if !pending.is_empty() {
+            debug!(key = %self.key, queued = pending.len(), "runtime attached; running queued work");
+        }
+        for job in pending {
+            job(handle.clone());
+        }
+        RuntimeAttachment {
+            slot: Arc::clone(self),
+            id,
+        }
+    }
+
+    /// Undo attachment `id`, if it is still the current one. Its tunnel goes
+    /// with it, for the same reason as in `attach_runtime`.
+    fn detach_runtime(&self, id: u64) {
+        let live = {
+            let mut runtime = self.runtime.lock();
+            if runtime.attachment != id {
+                return;
+            }
+            let _config = self.config.lock();
+            runtime.attachment = 0;
+            runtime.handle = None;
+            self.generation.fetch_add(1, Ordering::SeqCst);
+            self.live.write().take()
+        };
+        drop(live);
+        debug!(key = %self.key, "runtime detached");
+    }
+
+    /// Run `job` with the attached runtime, now if there is one, otherwise as
+    /// soon as one is attached. This closes the gap between Picard installing a
+    /// config and leaf's runtime existing: a request in that window waits for
+    /// leaf instead of failing. Unconfigured work is dropped unrun, and so is
+    /// queued work on `clear`; dropping it is how its owner learns it never ran.
+    pub fn on_runtime(&self, job: impl FnOnce(tokio::runtime::Handle) + Send + 'static) {
+        let mut runtime = self.runtime.lock();
+        if !self.is_configured() {
+            drop(runtime);
+            drop(job);
+            return;
+        }
+        match runtime.handle.clone() {
+            Some(handle) => {
+                drop(runtime);
+                job(handle);
+            }
+            None => runtime.pending.push(Box::new(job)),
+        }
     }
 
     /// The live tunnel if there is one, without connecting. Sync and cheap.
@@ -133,31 +266,31 @@ impl WgSlot {
 
     /// Get the live tunnel, connecting on first use.
     pub async fn live(&self) -> Result<Arc<Live>, SlotError> {
-        let wanted = self.generation.load(Ordering::SeqCst);
-
         // Fast path: no lock contention for the common case.
         if let Some(live) = self.current() {
             return Ok(live);
         }
-
         // Slow path. Serialise connects so a burst of first-use requests
         // builds one tunnel rather than one each.
         let _connecting = self.connecting.lock().await;
         if let Some(live) = self.current() {
             return Ok(live);
         }
+        let (cfg, wanted) = {
+            let config = self.config.lock();
+            let cfg = config
+                .clone()
+                .ok_or_else(|| SlotError::NotConfigured(self.key.clone()))?;
+            (cfg, self.generation.load(Ordering::SeqCst))
+        };
         // A superseded tunnel is dropped here, releasing its buffers before we
         // allocate the replacement.
         if self.live_generation.load(Ordering::SeqCst) != wanted {
             self.live.write().take();
         }
 
-        let cfg = self
-            .config
-            .lock()
-            .clone()
-            .ok_or_else(|| SlotError::NotConfigured(self.key.clone()))?;
-
+        // The tunnel's tasks are spawned on whichever runtime we are on.
+        let built_on = tokio::runtime::Handle::current().id();
         let (tunnel, device, tasks) = WgTunnel::connect(&cfg).await?;
         let stack = WgStack::new(device, &tunnel)?;
         let live = Arc::new(Live {
@@ -165,9 +298,30 @@ impl WgSlot {
             stack,
             tasks,
         });
-        *self.runtime.lock() = Some(tokio::runtime::Handle::current());
-        self.live_generation.store(wanted, Ordering::SeqCst);
-        *self.live.write() = Some(Arc::clone(&live));
+        self.publish_live(wanted, built_on, live)
+    }
+
+    /// Publish `live` unless the config or lifecycle moved on while it was being
+    /// built, or it was built on a runtime other than the attached one (the old
+    /// leaf instance, still winding down after a restart). With no runtime
+    /// attached -- standalone use, or the gap before the new instance attaches
+    /// -- it is published, and the next `attach_runtime` drops it if stale.
+    fn publish_live(
+        &self,
+        wanted: u64,
+        built_on: tokio::runtime::Id,
+        live: Arc<Live>,
+    ) -> Result<Arc<Live>, SlotError> {
+        {
+            let runtime = self.runtime.lock();
+            let config = self.config.lock();
+            let foreign = runtime.handle.as_ref().is_some_and(|h| h.id() != built_on);
+            if config.is_none() || self.generation.load(Ordering::SeqCst) != wanted || foreign {
+                return Err(SlotError::Superseded(self.key.clone()));
+            }
+            self.live_generation.store(wanted, Ordering::SeqCst);
+            *self.live.write() = Some(Arc::clone(&live));
+        }
         info!(key = %self.key, "wireguard tunnel up");
         Ok(live)
     }
@@ -244,11 +398,23 @@ pub fn stop_all() {
 mod tests {
     use super::*;
 
+    fn config() -> WgConfig {
+        WgConfig::parse(
+            "[Interface]\nPrivateKey = LAr1aNSNF9d0MjwUgAVC4020T0N/E5NUtqVv5EnsSz0=\n\
+             Address = 10.0.0.2\n[Peer]\nPublicKey = e8LKAc+f9xEzq9Ar7+MfKRrs+gZ/4yzvpRJLRJ/VJ1w=\n\
+             Endpoint = 127.0.0.1:1\n",
+        )
+        .unwrap()
+    }
+
     #[test]
     fn slot_is_stable_per_key() {
         let a = slot("test-stable");
         let b = slot("test-stable");
-        assert!(Arc::ptr_eq(&a, &b), "the same key must map to the same slot");
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "the same key must map to the same slot"
+        );
         assert_eq!(a.key(), "test-stable");
     }
 
@@ -281,12 +447,7 @@ mod tests {
     #[tokio::test]
     async fn setting_a_config_bumps_the_generation() {
         let s = slot("test-generation");
-        let cfg = WgConfig::parse(
-            "[Interface]\nPrivateKey = LAr1aNSNF9d0MjwUgAVC4020T0N/E5NUtqVv5EnsSz0=\n\
-             Address = 10.0.0.2\n[Peer]\nPublicKey = e8LKAc+f9xEzq9Ar7+MfKRrs+gZ/4yzvpRJLRJ/VJ1w=\n\
-             Endpoint = 127.0.0.1:1\n",
-        )
-        .unwrap();
+        let cfg = config();
         assert_eq!(s.generation.load(Ordering::SeqCst), 0);
         s.set_config(cfg.clone());
         assert_eq!(s.generation.load(Ordering::SeqCst), 1);
@@ -295,6 +456,154 @@ mod tests {
         assert_eq!(s.generation.load(Ordering::SeqCst), 2);
         s.clear();
         assert!(!s.is_configured());
+    }
+
+    #[tokio::test]
+    async fn work_waits_for_a_runtime_and_clear_detaches_it() {
+        use std::sync::atomic::AtomicUsize;
+        let s = slot("test-runtime");
+        s.set_config(config());
+        let ran = Arc::new(AtomicUsize::new(0));
+        let job = |ran: &Arc<AtomicUsize>| {
+            let ran = Arc::clone(ran);
+            move |_: tokio::runtime::Handle| {
+                ran.fetch_add(1, Ordering::SeqCst);
+            }
+        };
+
+        assert!(s.runtime().is_none());
+        s.on_runtime(job(&ran));
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            0,
+            "no runtime yet: the job must wait"
+        );
+
+        let _attached = s.attach_runtime(tokio::runtime::Handle::current());
+        assert_eq!(ran.load(Ordering::SeqCst), 1, "attaching runs queued work");
+        s.on_runtime(job(&ran));
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            2,
+            "with a runtime, work runs at once"
+        );
+
+        // `clear` means the owning leaf instance is going away: forget its
+        // runtime, and drop queued work rather than ever running it.
+        s.clear();
+        assert!(s.runtime().is_none());
+        s.set_config(config());
+        s.on_runtime(job(&ran));
+        let dropped = Arc::new(());
+        let witness = Arc::clone(&dropped);
+        s.on_runtime(move |_| drop(witness));
+        s.clear();
+        assert_eq!(
+            Arc::strong_count(&dropped),
+            1,
+            "clear must drop queued work"
+        );
+        let _attached = s.attach_runtime(tokio::runtime::Handle::current());
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            2,
+            "work dropped by clear never runs"
+        );
+        s.clear();
+    }
+
+    #[tokio::test]
+    async fn work_submitted_after_clear_is_dropped() {
+        let s = slot("test-runtime-after-clear");
+        s.set_config(config());
+        s.clear();
+        let dropped = Arc::new(());
+        let witness = Arc::clone(&dropped);
+        s.on_runtime(move |_| drop(witness));
+        assert_eq!(Arc::strong_count(&dropped), 1);
+    }
+
+    #[tokio::test]
+    async fn stale_connect_cannot_restore_a_stopped_or_cleared_tunnel() {
+        let s = slot("test-stale-connect");
+        s.set_config(config());
+        let live = s.live().await.unwrap();
+        let generation = s.generation.load(Ordering::SeqCst);
+        s.stop();
+        assert!(matches!(
+            s.publish_live(generation, tokio::runtime::Handle::current().id(), Arc::clone(&live)),
+            Err(SlotError::Superseded(_))
+        ));
+        assert!(s.current().is_none());
+
+        s.clear();
+        assert!(matches!(
+            s.publish_live(generation, tokio::runtime::Handle::current().id(), live),
+            Err(SlotError::Superseded(_))
+        ));
+        assert!(s.current().is_none());
+        assert!(s.runtime().is_none());
+    }
+
+    /// A leaf instance that exits, or fails to start, takes its runtime with it.
+    /// Only the current attachment may detach: an older instance winding down
+    /// after a restart must not detach its replacement.
+    #[tokio::test]
+    async fn only_the_current_attachment_detaches() {
+        let s = slot("test-attachment");
+        let first = s.attach_runtime(tokio::runtime::Handle::current());
+        assert!(s.runtime().is_some());
+        drop(first);
+        assert!(s.runtime().is_none(), "dropping the attachment detaches");
+
+        let old = s.attach_runtime(tokio::runtime::Handle::current());
+        let new = s.attach_runtime(tokio::runtime::Handle::current());
+        drop(old);
+        assert!(s.runtime().is_some(), "a superseded attachment must not detach");
+
+        s.clear();
+        let after_clear = s.attach_runtime(tokio::runtime::Handle::current());
+        drop(new);
+        assert!(s.runtime().is_some(), "an attachment from before clear is stale");
+        drop(after_clear);
+        assert!(s.runtime().is_none());
+    }
+
+    /// A leaf restart: `px_shutdown` returns before the old runtime exits, so a
+    /// connect can still run there after the new instance exists. Whichever
+    /// order the old runtime's publish and the new runtime's attach happen in,
+    /// a tunnel whose tasks live on the old runtime must not end up current.
+    #[tokio::test]
+    async fn a_tunnel_from_a_previous_runtime_never_ends_up_current() {
+        let s = slot("test-foreign-runtime");
+        s.set_config(config());
+        // The replacement instance's runtime. Built and dropped off this one,
+        // because tokio refuses to drop a runtime from async context.
+        let other = std::thread::spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+        })
+        .join()
+        .unwrap();
+
+        // New owner attached first: our connect is refused outright.
+        let attached = s.attach_runtime(other.handle().clone());
+        assert!(matches!(s.live().await, Err(SlotError::Superseded(_))));
+        assert!(s.current().is_none());
+        drop(attached);
+
+        // Our connect published first (nothing attached): attaching drops it.
+        let live = s.live().await.unwrap();
+        assert!(s.current().is_some());
+        let _attached = s.attach_runtime(other.handle().clone());
+        assert!(
+            s.current().is_none(),
+            "a new owner must drop the previous runtime's tunnel"
+        );
+        drop(live);
+        s.clear();
+        std::thread::spawn(move || drop(other)).join().unwrap();
     }
 
     #[tokio::test]

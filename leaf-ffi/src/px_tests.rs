@@ -230,32 +230,87 @@ extern "C" fn dns_callback(json: *const c_char, user_data: *mut c_void) {
     DNS_HITS.fetch_add(1, Ordering::SeqCst);
 }
 
+/// Per-test callback sink, passed as `user_data` so parallel tests never see
+/// each other's callbacks. Also proves `user_data` round-trips untouched.
+struct Probe(Mutex<Vec<Option<String>>>);
+
+impl Probe {
+    const fn new() -> Self {
+        Self(Mutex::new(Vec::new()))
+    }
+    fn user_data(&'static self) -> *mut c_void {
+        self as *const Probe as *mut c_void
+    }
+    fn calls(&'static self) -> Vec<Option<String>> {
+        lock(&self.0).clone()
+    }
+    /// Up to 15 s: long enough for a handshake plus one retried DNS query
+    /// (wg-netstack's per-query timeout is 5 s).
+    fn wait_for_calls(&'static self, n: usize) -> Vec<Option<String>> {
+        for _ in 0..600 {
+            if lock(&self.0).len() >= n {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        self.calls()
+    }
+}
+
+extern "C" fn probe_callback(json: *const c_char, user_data: *mut c_void) {
+    // SAFETY: every caller passes `Probe::user_data` of a `'static` probe.
+    let probe = unsafe { &*(user_data as *const Probe) };
+    let value = (!json.is_null()).then(|| {
+        unsafe { CStr::from_ptr(json) }
+            .to_str()
+            .expect("DNS JSON must be valid UTF-8")
+            .to_owned()
+    });
+    lock(&probe.0).push(value);
+}
+
 #[test]
-fn dns_resolve_requires_a_live_tunnel_and_never_double_fires() {
-    let key = c("px-test-dns");
+fn dns_resolve_rejects_bad_arguments() {
+    let key = c("px-test-dns-args");
     let conf = c(GOOD_CONF);
     let host = c("example.internal");
+    static PROBE: Probe = Probe::new();
 
     unsafe {
-        assert_eq!(px::px_wg_set_config(key.as_ptr(), conf.as_ptr()), px::PX_OK);
-
-        // Configured but never used: no runtime is captured yet, so a resolve
-        // is refused rather than silently bringing a VPN tunnel up. That is a
-        // policy decision for Picard, not for us.
+        // No slot, and a slot with no config, are both "not configured".
         assert_eq!(
             px::px_wg_resolve(
                 key.as_ptr(),
                 host.as_ptr(),
                 true,
-                Some(dns_callback),
-                SENTINEL as *mut c_void
+                Some(probe_callback),
+                PROBE.user_data()
             ),
-            px::PX_ERR_NOT_RUNNING
+            px::PX_ERR_NOT_CONFIGURED
+        );
+        assert_eq!(px::px_wg_set_config(key.as_ptr(), conf.as_ptr()), px::PX_OK);
+        px::px_wg_clear(key.as_ptr());
+        assert_eq!(
+            px::px_wg_resolve(
+                key.as_ptr(),
+                host.as_ptr(),
+                true,
+                Some(probe_callback),
+                PROBE.user_data()
+            ),
+            px::PX_ERR_NOT_CONFIGURED
         );
 
         // A null callback is rejected before any work is queued.
+        assert_eq!(px::px_wg_set_config(key.as_ptr(), conf.as_ptr()), px::PX_OK);
         assert_eq!(
-            px::px_wg_resolve(key.as_ptr(), host.as_ptr(), true, None, std::ptr::null_mut()),
+            px::px_wg_resolve(
+                key.as_ptr(),
+                host.as_ptr(),
+                true,
+                None,
+                std::ptr::null_mut()
+            ),
             px::PX_ERR_BAD_ARGUMENT
         );
 
@@ -263,6 +318,276 @@ fn dns_resolve_requires_a_live_tunnel_and_never_double_fires() {
         assert!(!px::px_wg_resolve_cancel(4242));
         px::px_wg_clear(key.as_ptr());
     }
+    assert!(
+        PROBE.calls().is_empty(),
+        "a rejected request must never call back"
+    );
+}
+
+/// Configured, but the leaf instance has not started yet: the request waits
+/// for it instead of being refused. If the tunnel is cleared instead, the
+/// callback still fires -- once, with NULL -- so the caller's retained
+/// `user_data` is released and it is not left waiting on a timeout.
+#[test]
+fn dns_resolve_before_leaf_starts_is_queued_and_cleared_with_null() {
+    let key = c("px-test-dns-queued");
+    let conf = c(GOOD_CONF);
+    let host = c("example.internal");
+    static PROBE: Probe = Probe::new();
+
+    unsafe {
+        assert_eq!(px::px_wg_set_config(key.as_ptr(), conf.as_ptr()), px::PX_OK);
+        let id = px::px_wg_resolve(
+            key.as_ptr(),
+            host.as_ptr(),
+            true,
+            Some(probe_callback),
+            PROBE.user_data(),
+        );
+        assert!(id > 0, "expected a request id, got {id}");
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            PROBE.calls().is_empty(),
+            "nothing can run before leaf has a runtime"
+        );
+
+        px::px_wg_clear(key.as_ptr());
+    }
+    assert_eq!(
+        PROBE.calls(),
+        vec![None],
+        "clear must fire the callback exactly once, with NULL"
+    );
+    assert!(
+        !px::px_wg_resolve_cancel(1_000_000),
+        "an unknown id is false"
+    );
+}
+
+/// Cancel completes the request on the cancelling thread, with NULL, and the
+/// work never calls back a second time -- including when leaf attaches its
+/// runtime afterwards.
+#[test]
+fn dns_resolve_cancel_fires_null_exactly_once() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let key = c("px-test-dns-cancel");
+    let conf = c(GOOD_CONF);
+    let host = c("example.internal");
+    static PROBE: Probe = Probe::new();
+
+    unsafe {
+        assert_eq!(px::px_wg_set_config(key.as_ptr(), conf.as_ptr()), px::PX_OK);
+        let id = px::px_wg_resolve(
+            key.as_ptr(),
+            host.as_ptr(),
+            true,
+            Some(probe_callback),
+            PROBE.user_data(),
+        );
+        assert!(id > 0);
+        let request = px::request_table().lock().get(&id).unwrap().clone();
+
+        assert!(
+            px::px_wg_resolve_cancel(id),
+            "a pending request is cancellable"
+        );
+        assert_eq!(PROBE.calls(), vec![None], "cancel fires NULL synchronously");
+        assert!(!px::px_wg_resolve_cancel(id), "a second cancel is a no-op");
+
+        let slot = wg_netstack::registry::slot("px-test-dns-cancel");
+        let _attached = slot.attach_runtime(rt.handle().clone());
+        assert!(
+            request.upgrade().is_none(),
+            "attaching runs the cancelled job, which releases the request"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            slot.current().is_none(),
+            "cancelled work must not start a tunnel"
+        );
+        px::px_wg_clear(key.as_ptr());
+    }
+    assert_eq!(
+        PROBE.calls(),
+        vec![None],
+        "the callback must fire exactly once"
+    );
+}
+
+#[test]
+fn dns_resolve_cancel_before_task_poll_fires_null_once() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let key = c("px-test-dns-cancel-spawned");
+    let conf = c(GOOD_CONF);
+    let host = c("example.internal");
+    static PROBE: Probe = Probe::new();
+    let slot = wg_netstack::registry::slot("px-test-dns-cancel-spawned");
+
+    unsafe {
+        assert_eq!(px::px_wg_set_config(key.as_ptr(), conf.as_ptr()), px::PX_OK);
+    }
+    let _attached = slot.attach_runtime(rt.handle().clone());
+    let id = unsafe {
+        px::px_wg_resolve(
+            key.as_ptr(),
+            host.as_ptr(),
+            true,
+            Some(probe_callback),
+            PROBE.user_data(),
+        )
+    };
+    assert!(id > 0);
+    let request = px::request_table().lock().get(&id).unwrap().clone();
+    assert!(px::px_wg_resolve_cancel(id));
+    assert_eq!(PROBE.calls(), vec![None]);
+    rt.block_on(async { tokio::task::yield_now().await });
+    assert!(request.upgrade().is_none());
+    assert!(slot.current().is_none());
+    unsafe { px::px_wg_clear(key.as_ptr()) };
+    assert_eq!(PROBE.calls(), vec![None]);
+}
+
+/// A runtime that shut down while still attached (an instance that died
+/// without `px_wg_clear`): the resolve cannot run, and must say so with one NULL
+/// rather than vanish. Picard runs leaf on a current-thread runtime, so test
+/// that flavour as well as the default one.
+fn stopped_runtime_fires_null_once(rt: tokio::runtime::Runtime, name: &str, probe: &'static Probe) {
+    let key = c(name);
+    let conf = c(GOOD_CONF);
+    let host = c("example.internal");
+    let slot = wg_netstack::registry::slot(name);
+
+    unsafe {
+        assert_eq!(px::px_wg_set_config(key.as_ptr(), conf.as_ptr()), px::PX_OK);
+    }
+    let _attached = slot.attach_runtime(rt.handle().clone());
+    drop(rt);
+    let id = unsafe {
+        px::px_wg_resolve(
+            key.as_ptr(),
+            host.as_ptr(),
+            true,
+            Some(probe_callback),
+            probe.user_data(),
+        )
+    };
+    assert!(id > 0);
+    assert_eq!(probe.wait_for_calls(1), vec![None]);
+    assert!(!px::px_wg_resolve_cancel(id));
+    unsafe { px::px_wg_clear(key.as_ptr()) };
+    assert_eq!(probe.calls(), vec![None]);
+}
+
+#[test]
+fn dns_resolve_on_a_stopped_multi_thread_runtime_fires_null_once() {
+    static PROBE: Probe = Probe::new();
+    stopped_runtime_fires_null_once(
+        tokio::runtime::Runtime::new().unwrap(),
+        "px-test-dns-dead-mt",
+        &PROBE,
+    );
+}
+
+#[test]
+fn dns_resolve_on_a_stopped_current_thread_runtime_fires_null_once() {
+    static PROBE: Probe = Probe::new();
+    stopped_runtime_fires_null_once(
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap(),
+        "px-test-dns-dead-ct",
+        &PROBE,
+    );
+}
+
+/// The `px_shutdown` teardown path: a lookup already spawned on leaf's
+/// current-thread runtime, never finished, when that runtime is dropped. The
+/// runtime drops the future, and that must fire the callback, once, with NULL.
+#[test]
+fn dns_resolve_in_flight_when_runtime_drops_fires_null_once() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let key = c("px-test-dns-teardown");
+    let conf = c(GOOD_CONF);
+    let host = c("example.internal");
+    static PROBE: Probe = Probe::new();
+    let slot = wg_netstack::registry::slot("px-test-dns-teardown");
+
+    unsafe {
+        assert_eq!(px::px_wg_set_config(key.as_ptr(), conf.as_ptr()), px::PX_OK);
+    }
+    let _attached = slot.attach_runtime(rt.handle().clone());
+    let id = unsafe {
+        px::px_wg_resolve(
+            key.as_ptr(),
+            host.as_ptr(),
+            true,
+            Some(probe_callback),
+            PROBE.user_data(),
+        )
+    };
+    assert!(id > 0);
+    // Nothing drives a current-thread runtime but `block_on`, so the task is
+    // spawned and parked, exactly as leaf leaves it when told to shut down.
+    assert!(PROBE.calls().is_empty());
+    drop(rt);
+    assert_eq!(PROBE.calls(), vec![None], "teardown fires NULL exactly once");
+    assert!(!px::px_wg_resolve_cancel(id));
+    unsafe { px::px_wg_clear(key.as_ptr()) };
+    assert_eq!(PROBE.calls(), vec![None]);
+}
+
+/// The SASE split-tunnel regression: Picard asks for in-tunnel DNS before any
+/// traffic has been proxied -- and here, before leaf has even started. Nothing
+/// else brings the tunnel up; the resolve must, once leaf attaches its runtime.
+#[test]
+fn dns_resolve_before_any_traffic_brings_the_tunnel_up() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let key = c("px-test-dns-first-use");
+    static PROBE: Probe = Probe::new();
+
+    let peer = rt.block_on(async {
+        let peer = TestPeer::start(CLIENT_SECRET, PEER_SECRET).await;
+        peer.spawn_dns("first.internal", std::net::Ipv4Addr::new(10, 9, 0, 77), 60)
+            .await;
+        peer
+    });
+    let conf = c(&peer.client_config(CLIENT_SECRET));
+    let host = c("first.internal");
+    let slot = wg_netstack::registry::slot("px-test-dns-first-use");
+
+    unsafe {
+        assert_eq!(px::px_wg_set_config(key.as_ptr(), conf.as_ptr()), px::PX_OK);
+        let id = px::px_wg_resolve(
+            key.as_ptr(),
+            host.as_ptr(),
+            true,
+            Some(probe_callback),
+            PROBE.user_data(),
+        );
+        assert!(id > 0, "expected a request id, got {id}");
+    }
+    assert_eq!(slot.status().state, wg_netstack::TunnelState::Down);
+
+    // What leaf does when it builds the `wireguard` outbound at startup.
+    let _attached = slot.attach_runtime(rt.handle().clone());
+
+    assert_eq!(
+        PROBE.wait_for_calls(1),
+        vec![Some(r#"[{"ip":"10.9.0.77","ttl":60}]"#.to_string())],
+        "the resolve must bring the tunnel up and answer exactly once"
+    );
+    assert!(
+        slot.current().is_some(),
+        "the resolve brought the tunnel up"
+    );
+    unsafe { px::px_wg_clear(key.as_ptr()) };
 }
 
 /// The full DNS path: a live tunnel, a real in-tunnel responder, and the JSON
@@ -283,8 +608,9 @@ fn dns_resolve_returns_json_through_a_live_tunnel() {
         assert_eq!(px::px_wg_set_config(key.as_ptr(), conf.as_ptr()), px::PX_OK);
     }
 
-    // Bring the tunnel up, which is also what captures the runtime handle the
-    // C API needs.
+    // What leaf does at startup; the C API spawns its lookups here.
+    let _attached =
+        wg_netstack::registry::slot("px-test-dns-live").attach_runtime(rt.handle().clone());
     rt.block_on(async {
         wg_netstack::registry::slot("px-test-dns-live")
             .live()
@@ -296,7 +622,9 @@ fn dns_resolve_returns_json_through_a_live_tunnel() {
     // exists, while the handshake completes asynchronously -- so a live tunnel
     // legitimately reads as Handshaking for a few milliseconds.
     for _ in 0..200 {
-        if wg_netstack::registry::slot("px-test-dns-live").status().state
+        if wg_netstack::registry::slot("px-test-dns-live")
+            .status()
+            .state
             == wg_netstack::TunnelState::Up
         {
             break;
@@ -309,7 +637,10 @@ fn dns_resolve_returns_json_through_a_live_tunnel() {
         let mut status = std::mem::zeroed::<PxWgStatus>();
         assert_eq!(px::px_wg_get_status(key.as_ptr(), &mut status), px::PX_OK);
         assert_eq!(status.state, 2, "tunnel should be Up");
-        assert!(status.last_handshake_ms_ago >= 0, "should have a handshake age");
+        assert!(
+            status.last_handshake_ms_ago >= 0,
+            "should have a handshake age"
+        );
     }
 
     DNS_HITS.store(0, Ordering::SeqCst);
